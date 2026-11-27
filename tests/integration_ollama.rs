@@ -469,3 +469,63 @@ async fn execute_with_cancel_aborts_in_flight_request_with_exit_130() {
         Some(ErrorCategory::Cancelled)
     );
 }
+
+#[tokio::test]
+async fn retries_transient_503_on_tags_but_never_retries_chat_inference() {
+    let server = MockServer::start().await;
+
+    // First `/api/tags` fails with 503, second succeeds -> should recover.
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error": "starting" })))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/tags"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(tags_payload_with_qwen()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // `/api/chat` returns 503 -> must be called strictly ONCE (never retried).
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({ "error": "busy" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = WorkerConfig::new(&server.uri(), 10, false, None).expect("valid config");
+    let client = HttpOllamaClient::new(config)
+        .expect("client should build")
+        .with_retry_policy(ollama_worker::RetryPolicy::new(
+            2,
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
+    let executor = TaskExecutor::new(client, true);
+
+    let models = executor
+        .models()
+        .await
+        .expect("transient 503 on /api/tags should recover");
+    assert_eq!(models.len(), 1);
+
+    // Run against a fresh server for the chat non-retry assertion (tags already verified above).
+    let chat_executor = TaskExecutor::new(
+        HttpOllamaClient::new(WorkerConfig::new(&server.uri(), 10, false, None).unwrap())
+            .unwrap()
+            .with_retry_policy(ollama_worker::RetryPolicy::new(
+                2,
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+            )),
+        false,
+    );
+    let chat_res = chat_executor
+        .execute(&TaskRequest::new("no-retry-chat", "qwen2.5-coder:3b", "hi"))
+        .await;
+    assert_eq!(chat_res.exit_code(), 3);
+}

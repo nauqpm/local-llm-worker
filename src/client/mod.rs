@@ -5,6 +5,7 @@
 //! streaming TTFT measurements, and per-request inference controls.
 
 pub mod http;
+pub mod retry;
 pub mod types;
 
 use std::future::Future;
@@ -12,6 +13,7 @@ use std::future::Future;
 use crate::error::WorkerResult;
 
 pub use http::HttpOllamaClient;
+pub use retry::{MAX_ALLOWED_RETRIES, RetryPolicy};
 pub use types::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,
     InstalledModel, ModelDetails, OllamaOptions, RunningModel, StreamedChatResponse,

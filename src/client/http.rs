@@ -7,6 +7,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::client::OllamaClient;
+use crate::client::retry::RetryPolicy;
 use crate::client::types::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,
     InstalledModel, PsResponse, RunningModel, StreamedChatResponse, TagsResponse, VersionResponse,
@@ -54,6 +55,7 @@ struct ChatStreamChunk {
 pub struct HttpOllamaClient {
     config: WorkerConfig,
     http: Client,
+    retry_policy: RetryPolicy,
 }
 
 impl HttpOllamaClient {
@@ -66,7 +68,18 @@ impl HttpOllamaClient {
                 message: format!("failed to initialize HTTP client: {err}"),
             })?;
 
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            retry_policy: RetryPolicy::default(),
+        })
+    }
+
+    /// Overrides the [`RetryPolicy`] used for idempotent metadata endpoints.
+    #[must_use]
+    pub const fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     /// Returns a reference to the underlying validated configuration.
@@ -129,20 +142,29 @@ impl HttpOllamaClient {
 
 impl OllamaClient for HttpOllamaClient {
     async fn version(&self) -> WorkerResult<VersionResponse> {
-        self.send_json::<(), VersionResponse>(Method::GET, "/api/version", None, None)
+        self.retry_policy
+            .execute_idempotent("GET /api/version", || {
+                self.send_json::<(), VersionResponse>(Method::GET, "/api/version", None, None)
+            })
             .await
     }
 
     async fn list_models(&self) -> WorkerResult<Vec<InstalledModel>> {
         let resp: TagsResponse = self
-            .send_json::<(), TagsResponse>(Method::GET, "/api/tags", None, None)
+            .retry_policy
+            .execute_idempotent("GET /api/tags", || {
+                self.send_json::<(), TagsResponse>(Method::GET, "/api/tags", None, None)
+            })
             .await?;
         Ok(resp.models)
     }
 
     async fn list_running_models(&self) -> WorkerResult<Vec<RunningModel>> {
         let resp: PsResponse = self
-            .send_json::<(), PsResponse>(Method::GET, "/api/ps", None, None)
+            .retry_policy
+            .execute_idempotent("GET /api/ps", || {
+                self.send_json::<(), PsResponse>(Method::GET, "/api/ps", None, None)
+            })
             .await?;
         Ok(resp.models)
     }

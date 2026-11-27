@@ -14,8 +14,8 @@ pub mod validation;
 
 pub use client::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,
-    HttpOllamaClient, InstalledModel, ModelDetails, OllamaClient, OllamaOptions, RunningModel,
-    StreamedChatResponse, VersionResponse, model_matches,
+    HttpOllamaClient, InstalledModel, MAX_ALLOWED_RETRIES, ModelDetails, OllamaClient,
+    OllamaOptions, RetryPolicy, RunningModel, StreamedChatResponse, VersionResponse, model_matches,
 };
 pub use config::{InferenceOptions, WorkerConfig};
 pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
