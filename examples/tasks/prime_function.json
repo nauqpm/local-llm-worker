@@ -1,0 +1,25 @@
+{
+  "schema_version": "1",
+  "task_id": "example-prime-001",
+  "task_type": "generate_function",
+  "language": "python",
+  "instruction": "Implement a function `is_prime(n: int) -> bool` that checks whether an integer is prime.",
+  "context": "",
+  "constraints": [
+    "Use Python standard library only",
+    "Handle integers less than 2 cleanly",
+    "Return only the implementation",
+    "Do not modify files"
+  ],
+  "model": "qwen2.5-coder:3b",
+  "options": {
+    "temperature": 0.1,
+    "max_tokens": 256,
+    "seed": 42
+  },
+  "output_expectation": {
+    "format": "code",
+    "extract_code_block": true,
+    "max_output_chars": 4000
+  }
+}

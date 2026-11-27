@@ -52,7 +52,7 @@
 - `M1.5`: `cli.rs` & `main.rs` (`health`, `models`, `run --model --task`, `stdout` JSON / `stderr` logs).
 - `M1.6`: `wiremock` integration tests, CLI tests, and opt-in live test (`#[ignore]`).
 
-### M2 — Task-Oriented Worker
+### M2 — Task-Oriented Worker *(Completed)*
 - `M2.1`: Versioned `TaskRequest` v1, 7 core `TaskType`s, `TaskResult` with `validation` block.
 - `M2.2`: `prompt.rs` templates, delimiter isolation, token estimator, and context budget enforcement.
 - `M2.3`: `validation.rs` (non-empty, length, code-block extractor, JSON / `jsonschema`, `done_reason` check).
