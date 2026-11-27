@@ -6,13 +6,20 @@
 
 pub mod config;
 pub mod error;
+pub mod metrics;
 pub mod ollama;
+pub mod task;
 
 pub use config::{InferenceOptions, WorkerConfig};
 pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
+pub use metrics::InferenceMetrics;
 pub use ollama::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, HttpOllamaClient, InstalledModel,
     ModelDetails, OllamaClient, OllamaOptions, RunningModel, VersionResponse, model_matches,
+};
+pub use task::{
+    DEFAULT_SYSTEM_PROMPT, HealthReport, SCHEMA_VERSION, TaskExecutor, TaskRequest, TaskResult,
+    TaskStatus,
 };
 
 /// Default loopback base URL for a local Ollama server.
