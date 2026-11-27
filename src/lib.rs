@@ -6,9 +6,14 @@
 
 pub mod config;
 pub mod error;
+pub mod ollama;
 
 pub use config::{InferenceOptions, WorkerConfig};
 pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
+pub use ollama::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, HttpOllamaClient, InstalledModel,
+    ModelDetails, OllamaClient, OllamaOptions, RunningModel, VersionResponse, model_matches,
+};
 
 /// Default loopback base URL for a local Ollama server.
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
