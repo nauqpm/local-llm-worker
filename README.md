@@ -34,8 +34,14 @@ ollama-worker models --json
 # Run a task from JSON file and save the structured result
 ollama-worker run --input examples/tasks/prime_function.json --output result.json
 
+# Run with NDJSON streaming enabled to record Time to First Token (TTFT)
+ollama-worker run --input examples/tasks/prime_function.json --stream --pretty
+
 # Pipe a task from stdin (convenient for Codex / automation)
 cat examples/tasks/structured_json.json | ollama-worker run --stdin
+
+# Run the built-in reproducible benchmark suite (S1 Small / S2 Medium / S3 Large)
+ollama-worker benchmark --model qwen2.5-coder:3b --stream --iterations 2 --pretty
 ```
 
 ### Opt-in Live Tests (Requires Local Ollama)

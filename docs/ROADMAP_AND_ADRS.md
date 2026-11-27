@@ -60,13 +60,13 @@
 - `M2.5`: Comprehensive unit & mock integration tests for all task types and validation failures.
 - `M2.6`: Standalone Codex delegation guide and example task fixtures.
 
-### M3 — Performance and Reliability
-- `M3.1`: Modularize `src/client/`, add NDJSON streaming and TTFT metrics.
-- `M3.2`: Graceful `SIGINT`/`SIGTERM` cancellation (Exit `130`).
-- `M3.3`: Bounded exponential backoff retry for idempotent/connect failures only.
-- `M3.4`: `benchmark` subcommand and reproducible benchmark scripts (`curl` vs `ollama-worker` vs OpenCode).
-- `M3.5`: GitHub Actions `release.yml` for static `x86_64-unknown-linux-musl` binaries + `SHA256SUMS`.
-- `M3.6`: Run empirical benchmarks on Home Server and document measured findings.
+### M3 — Performance and Reliability *(Code & Release Pipeline Completed; Live Home Server Benchmark Pending)*
+- `M3.1` *(Done)*: Modularized `src/client/`, added NDJSON streaming and TTFT (`ttft_ms`) metrics plus `/api/generate` support.
+- `M3.2` *(Done)*: Graceful `SIGINT`/`SIGTERM` cancellation (Exit `130`).
+- `M3.3` *(Done)*: Bounded exponential backoff retry for idempotent endpoints only (never retries inference).
+- `M3.4` *(Done)*: `benchmark` subcommand and reproducible `benchmarks/` scripts (`curl` vs `ollama-worker` vs OpenCode).
+- `M3.5` *(Done)*: GitHub Actions `release.yml` for static `x86_64-unknown-linux-musl` binaries + `SHA256SUMS.txt`.
+- `M3.6` *(Pending User Approval / Home Server Run)*: Run empirical benchmarks on Home Server and document measured findings.
 
 ### M4 — LoopForge Integration
 - `M4.1`: Verify Runner `v0.13.2` Native Sandbox environment (`PATH`, env vars, `127.0.0.1:11434`).
