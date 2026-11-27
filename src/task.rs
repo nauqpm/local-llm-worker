@@ -11,6 +11,7 @@ use crate::error::{ErrorDetail, WorkerError, WorkerResult, exit_codes};
 use crate::metrics::InferenceMetrics;
 use crate::ollama::{ChatRequest, InstalledModel, OllamaClient, RunningModel, model_matches};
 use crate::prompt::PromptBuilder;
+use crate::validation::OutputValidator;
 
 /// Current structured schema version emitted in task requests and results.
 pub const SCHEMA_VERSION: &str = "1";
@@ -420,6 +421,7 @@ impl<C: OllamaClient> TaskExecutor<C> {
     /// Validates a task and renders the prompt + token estimate without calling Ollama.
     pub fn dry_run(&self, request: &TaskRequest) -> WorkerResult<DryRunReport> {
         request.validate()?;
+        OutputValidator::validate_request_schema(request)?;
         let built = self.prompt_builder.build(request)?;
         let json_format_enabled = request
             .output_expectation
@@ -443,6 +445,9 @@ impl<C: OllamaClient> TaskExecutor<C> {
     /// Executes a single task and always produces a structured [`TaskResult`].
     pub async fn execute(&self, request: &TaskRequest) -> TaskResult {
         if let Err(err) = request.validate() {
+            return TaskResult::from_error(&request.task_id, &request.model, &err);
+        }
+        if let Err(err) = OutputValidator::validate_request_schema(request) {
             return TaskResult::from_error(&request.task_id, &request.model, &err);
         }
 
@@ -497,20 +502,27 @@ impl<C: OllamaClient> TaskExecutor<C> {
         let metrics = InferenceMetrics::from_chat_response(&response, wall_clock);
 
         let raw_content = response.message.content;
-        let trimmed = raw_content.trim();
-        if trimmed.is_empty() {
-            let err = WorkerError::ValidationFailed {
-                message: "model returned an empty response".into(),
-            };
-            let report = ValidationReport {
-                passed: false,
-                extracted_code_block: false,
-                checks: vec![ValidationCheck::fail(
-                    "non_empty",
-                    "model returned an empty response",
-                )],
-                warnings: built.warnings,
-            };
+        let outcome = OutputValidator::validate(
+            request,
+            &raw_content,
+            response.done_reason.as_deref(),
+            built.warnings,
+        );
+
+        if !outcome.report.passed {
+            let summary = outcome
+                .report
+                .checks
+                .iter()
+                .filter(|c| !c.passed)
+                .map(|c| {
+                    c.detail
+                        .as_deref()
+                        .map_or_else(|| c.name.clone(), |d| format!("{}: {d}", c.name))
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let err = WorkerError::ValidationFailed { message: summary };
             return TaskResult {
                 schema_version: SCHEMA_VERSION.to_owned(),
                 task_id: task_id.to_owned(),
@@ -519,28 +531,21 @@ impl<C: OllamaClient> TaskExecutor<C> {
                 output: None,
                 raw_output: Some(raw_content),
                 done_reason: response.done_reason,
-                validation: Some(report),
+                validation: Some(outcome.report),
                 metrics: Some(metrics),
                 error: Some(err.to_detail()),
             };
         }
-
-        let report = ValidationReport {
-            passed: true,
-            extracted_code_block: false,
-            checks: vec![ValidationCheck::pass("non_empty")],
-            warnings: built.warnings,
-        };
 
         TaskResult {
             schema_version: SCHEMA_VERSION.to_owned(),
             task_id: task_id.to_owned(),
             status: TaskStatus::Success,
             model: response.model,
-            output: Some(trimmed.to_owned()),
+            output: outcome.normalized_output,
             raw_output: Some(raw_content),
             done_reason: response.done_reason,
-            validation: Some(report),
+            validation: Some(outcome.report),
             metrics: Some(metrics),
             error: None,
         }

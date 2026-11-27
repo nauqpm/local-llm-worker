@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod ollama;
 pub mod prompt;
 pub mod task;
+pub mod validation;
 
 pub use config::{InferenceOptions, WorkerConfig};
 pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
@@ -24,6 +25,7 @@ pub use task::{
     SCHEMA_VERSION, TaskExecutor, TaskRequest, TaskResult, TaskStatus, TaskType, ValidationCheck,
     ValidationReport,
 };
+pub use validation::{OutputValidator, ValidationOutcome};
 
 /// Default loopback base URL for a local Ollama server.
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
