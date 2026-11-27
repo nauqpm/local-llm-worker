@@ -6,9 +6,9 @@ use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 use ollama_worker::{
-    DEFAULT_OLLAMA_BASE_URL, DEFAULT_TIMEOUT_SECS, ErrorDetail, HttpOllamaClient, InferenceOptions,
-    InstalledModel, TaskExecutor, TaskRequest, TaskResult, TaskType, WorkerConfig, WorkerError,
-    WorkerResult,
+    BenchmarkConfig, BenchmarkEndpoint, BenchmarkRunner, BenchmarkSuite, DEFAULT_OLLAMA_BASE_URL,
+    DEFAULT_TIMEOUT_SECS, ErrorDetail, HttpOllamaClient, InferenceOptions, InstalledModel,
+    TaskExecutor, TaskRequest, TaskResult, TaskType, WorkerConfig, WorkerError, WorkerResult,
 };
 use serde::Serialize;
 
@@ -70,6 +70,55 @@ pub enum Commands {
     },
     /// Execute a single local inference task and emit structured JSON to stdout.
     Run(Box<RunArgs>),
+    /// Run a reproducible benchmark suite and emit structured metrics JSON.
+    Benchmark(Box<BenchmarkArgs>),
+}
+
+#[derive(Debug, Args)]
+pub struct BenchmarkArgs {
+    /// Target Ollama model name to benchmark (e.g., qwen2.5-coder:3b).
+    #[arg(long, env = "OLLAMA_WORKER_MODEL")]
+    pub model: String,
+
+    /// Optional path to a custom JSON benchmark suite (defaults to built-in S1/S2/S3 suite).
+    #[arg(long)]
+    pub suite: Option<PathBuf>,
+
+    /// Ollama endpoint to benchmark: chat, generate, or both.
+    #[arg(long, default_value = "chat")]
+    pub endpoint: String,
+
+    /// Number of iterations per scenario (1..=20).
+    #[arg(long, default_value_t = 1)]
+    pub iterations: usize,
+
+    /// Enable NDJSON streaming for `/api/chat` to record TTFT (`ttft_ms`).
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+
+    /// Unload the model (`keep_alive: "0"`) before iteration 1 of each scenario to measure cold start.
+    #[arg(long, default_value_t = false)]
+    pub cold_start: bool,
+
+    /// Deterministic temperature for benchmark runs (default 0.0).
+    #[arg(long, default_value_t = 0.0)]
+    pub temperature: f32,
+
+    /// Deterministic seed for benchmark runs (default 42).
+    #[arg(long, default_value_t = 42)]
+    pub seed: i64,
+
+    /// Optional explicit `num_ctx` override (e.g. 4096 vs 8192).
+    #[arg(long)]
+    pub num_ctx: Option<u32>,
+
+    /// Optional file path to write the benchmark report JSON.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Suppress stdout JSON when --output is used.
+    #[arg(long, default_value_t = false, requires = "output")]
+    pub quiet: bool,
 }
 
 #[derive(Debug, Args)]
@@ -191,6 +240,71 @@ pub async fn execute_cli(cli: Cli) -> ExitCode {
             )
             .await
         }
+        Commands::Benchmark(args) => {
+            run_benchmark(
+                cli.base_url,
+                cli.timeout,
+                cli.allow_remote_ollama,
+                *args,
+                pretty,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_benchmark(
+    base_url: String,
+    timeout: u64,
+    allow_remote_ollama: bool,
+    args: BenchmarkArgs,
+    pretty: bool,
+) -> ExitCode {
+    let config = match WorkerConfig::new(&base_url, timeout, allow_remote_ollama, None) {
+        Ok(cfg) => cfg,
+        Err(err) => return emit_command_error(&err, true, pretty),
+    };
+
+    let endpoint = match BenchmarkEndpoint::from_str(&args.endpoint) {
+        Ok(ep) => ep,
+        Err(err) => return emit_command_error(&err, true, pretty),
+    };
+
+    let suite = match &args.suite {
+        Some(path) => match read_limited_file(path, MAX_INPUT_BYTES).and_then(|raw| {
+            serde_json::from_str::<BenchmarkSuite>(&raw).map_err(|err| WorkerError::InvalidInput {
+                message: format!("failed to parse benchmark suite JSON: {err}"),
+            })
+        }) {
+            Ok(s) => s,
+            Err(err) => return emit_command_error(&err, true, pretty),
+        },
+        None => BenchmarkSuite::default_suite(),
+    };
+
+    let bench_config = BenchmarkConfig {
+        model: args.model,
+        endpoint,
+        iterations: args.iterations,
+        stream: args.stream,
+        cold_start: args.cold_start,
+        temperature: args.temperature,
+        seed: Some(args.seed),
+        num_ctx: args.num_ctx,
+    };
+
+    let client = match HttpOllamaClient::new(config.clone()) {
+        Ok(c) => c,
+        Err(err) => return emit_command_error(&err, true, pretty),
+    };
+
+    let runner = BenchmarkRunner::new(client);
+    match runner
+        .run(&bench_config, &suite, config.base_url_str())
+        .await
+    {
+        Ok(report) => emit_payload(&report, args.output.as_deref(), args.quiet, pretty, 0),
+        Err(err) => emit_command_error(&err, true, pretty),
     }
 }
 

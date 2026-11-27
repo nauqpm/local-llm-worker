@@ -4,6 +4,7 @@
 //! metrics calculation, and non-executing output validation logic from the CLI
 //! entry point.
 
+pub mod benchmark;
 pub mod client;
 pub mod config;
 pub mod error;
@@ -11,6 +12,11 @@ pub mod metrics;
 pub mod prompt;
 pub mod task;
 pub mod validation;
+
+pub use benchmark::{
+    BenchmarkConfig, BenchmarkEndpoint, BenchmarkReport, BenchmarkRunner, BenchmarkScenario,
+    BenchmarkSuite, BenchmarkSummary, MAX_BENCHMARK_ITERATIONS, ScenarioRunRecord,
+};
 
 pub use client::{
     ChatMessage, ChatRequest, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,

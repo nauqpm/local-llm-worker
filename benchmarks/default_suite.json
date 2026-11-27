@@ -1,0 +1,30 @@
+{
+  "scenarios": [
+    {
+      "id": "s1_small",
+      "label": "Small prompt (~100-200 tokens): isolated Python function",
+      "task_type": "generate_function",
+      "language": "python",
+      "instruction": "Implement `is_prime(n: int) -> bool` using only the Python standard library.",
+      "context": "",
+      "constraints": [
+        "Handle n < 2 cleanly",
+        "Return only the function implementation"
+      ],
+      "max_tokens": 256
+    },
+    {
+      "id": "s2_medium",
+      "label": "Medium prompt (~300-600 tokens): pytest unit tests for TokenBucket",
+      "task_type": "generate_unit_test",
+      "language": "python",
+      "instruction": "Write concise pytest unit tests for TokenBucket.allow covering refill, exhaustion, and invalid cost.",
+      "context": "from dataclasses import dataclass\n\n@dataclass\nclass TokenBucket:\n    capacity: int\n    refill_per_sec: float\n    tokens: float\n    last_ts: float\n\n    def allow(self, now: float, cost: int = 1) -> bool:\n        if cost <= 0:\n            raise ValueError('cost must be positive')\n        elapsed = max(0.0, now - self.last_ts)\n        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.refill_per_sec)\n        self.last_ts = now\n        if self.tokens >= cost:\n            self.tokens -= cost\n            return True\n        return False",
+      "constraints": [
+        "Use pytest style functions",
+        "Return only test code"
+      ],
+      "max_tokens": 384
+    }
+  ]
+}
