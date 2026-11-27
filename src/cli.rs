@@ -339,8 +339,33 @@ async fn run_task(
         };
     }
 
-    let result = executor.execute(&request).await;
+    let result = executor
+        .execute_with_cancel(&request, shutdown_signal())
+        .await;
     emit_task_result(&result, output_path.as_deref(), quiet, pretty)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 fn resolve_task_request(args: &RunArgs) -> WorkerResult<TaskRequest> {

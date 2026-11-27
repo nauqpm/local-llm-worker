@@ -435,3 +435,37 @@ async fn streaming_chat_assembles_ndjson_records_ttft_and_rejects_partial_stream
         Some(ErrorCategory::ProtocolError)
     );
 }
+
+#[tokio::test]
+async fn execute_with_cancel_aborts_in_flight_request_with_exit_130() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(chat_success_payload("too late")),
+        )
+        .mount(&server)
+        .await;
+
+    let executor = executor_for(&server.uri(), 30, false);
+    let req = TaskRequest::new("cancel-001", "qwen2.5-coder:3b", "Slow task");
+
+    let started = std::time::Instant::now();
+    let res = executor
+        .execute_with_cancel(&req, tokio::time::sleep(Duration::from_millis(80)))
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "cancellation should abort promptly, took {elapsed:?}"
+    );
+    assert_eq!(res.status, TaskStatus::Cancelled);
+    assert_eq!(res.exit_code(), 130);
+    assert_eq!(
+        res.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::Cancelled)
+    );
+}

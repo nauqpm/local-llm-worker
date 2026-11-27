@@ -1,5 +1,6 @@
 //! Task request/result contracts and the core [`TaskExecutor`] orchestrator.
 
+use std::future::Future;
 use std::str::FromStr;
 use std::time::Instant;
 
@@ -444,6 +445,18 @@ impl<C: OllamaClient> TaskExecutor<C> {
 
     /// Executes a single task and always produces a structured [`TaskResult`].
     pub async fn execute(&self, request: &TaskRequest) -> TaskResult {
+        self.execute_with_cancel(request, std::future::pending::<()>())
+            .await
+    }
+
+    /// Executes a single task while racing network I/O against `cancel`.
+    ///
+    /// When `cancel` completes, dropping the in-flight HTTP future closes the
+    /// underlying connection so Ollama can abort CPU token generation early.
+    pub async fn execute_with_cancel<F>(&self, request: &TaskRequest, cancel: F) -> TaskResult
+    where
+        F: Future<Output = ()> + Send,
+    {
         if let Err(err) = request.validate() {
             return TaskResult::from_error(&request.task_id, &request.model, &err);
         }
@@ -459,8 +472,18 @@ impl<C: OllamaClient> TaskExecutor<C> {
             Err(err) => return TaskResult::from_error(task_id, model, &err),
         };
 
+        tokio::pin!(cancel);
+
         if self.verify_model {
-            match self.client.list_models().await {
+            let list_result = tokio::select! {
+                biased;
+                () = &mut cancel => {
+                    return TaskResult::from_error(task_id, model, &WorkerError::Cancelled);
+                }
+                res = self.client.list_models() => res,
+            };
+
+            match list_result {
                 Ok(installed) => {
                     if !installed.iter().any(|m| model_matches(&m.name, model)) {
                         let err = WorkerError::ModelNotFound {
@@ -494,16 +517,25 @@ impl<C: OllamaClient> TaskExecutor<C> {
         }
 
         let started = Instant::now();
-        let (response, ttft_ms) = if request.options.stream {
-            match self.client.chat_stream(&chat_request).await {
-                Ok(streamed) => (streamed.response, streamed.ttft_ms),
-                Err(err) => return TaskResult::from_error(task_id, model, &err),
+        let inference_result = if request.options.stream {
+            tokio::select! {
+                biased;
+                () = &mut cancel => Err(WorkerError::Cancelled),
+                res = self.client.chat_stream(&chat_request) => {
+                    res.map(|streamed| (streamed.response, streamed.ttft_ms))
+                }
             }
         } else {
-            match self.client.chat(&chat_request).await {
-                Ok(resp) => (resp, None),
-                Err(err) => return TaskResult::from_error(task_id, model, &err),
+            tokio::select! {
+                biased;
+                () = &mut cancel => Err(WorkerError::Cancelled),
+                res = self.client.chat(&chat_request) => res.map(|resp| (resp, None)),
             }
+        };
+
+        let (response, ttft_ms) = match inference_result {
+            Ok(pair) => pair,
+            Err(err) => return TaskResult::from_error(task_id, model, &err),
         };
         let wall_clock = started.elapsed();
         let metrics =
