@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ollama::ChatResponse;
+use crate::client::ChatResponse;
 
 const NANOS_PER_MILLI: u64 = 1_000_000;
 const NANOS_PER_SEC_F64: f64 = 1_000_000_000.0;
@@ -12,10 +12,13 @@ const NANOS_PER_SEC_F64: f64 = 1_000_000_000.0;
 /// Performance metrics reported alongside a task result.
 ///
 /// Explicitly separates `worker_overhead_ms` (client serialization, HTTP round-trip,
-/// and validation) from Ollama's reported `total_duration_ms`.
+/// and validation) from Ollama's reported `total_duration_ms`, and includes optional
+/// `ttft_ms` (Time to First Token) when streaming is enabled.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InferenceMetrics {
     pub worker_overhead_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
     pub total_duration_ms: u64,
     pub load_duration_ms: u64,
     pub prompt_eval_duration_ms: u64,
@@ -31,6 +34,16 @@ impl InferenceMetrics {
     /// Ollama [`ChatResponse`] and the measured client-side `wall_clock` duration.
     #[must_use]
     pub fn from_chat_response(response: &ChatResponse, wall_clock: Duration) -> Self {
+        Self::from_chat_response_with_ttft(response, wall_clock, None)
+    }
+
+    /// Computes metrics including optional client-measured Time to First Token (`ttft_ms`).
+    #[must_use]
+    pub fn from_chat_response_with_ttft(
+        response: &ChatResponse,
+        wall_clock: Duration,
+        ttft_ms: Option<u64>,
+    ) -> Self {
         let total_duration_ms = ns_to_ms(response.total_duration);
         let load_duration_ms = ns_to_ms(response.load_duration);
         let prompt_eval_duration_ms = ns_to_ms(response.prompt_eval_duration);
@@ -53,6 +66,7 @@ impl InferenceMetrics {
 
         Self {
             worker_overhead_ms,
+            ttft_ms,
             total_duration_ms,
             load_duration_ms,
             prompt_eval_duration_ms,
@@ -83,7 +97,7 @@ fn tokens_per_second(tokens: u64, duration_ns: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ollama::{ChatMessage, ChatRole};
+    use crate::client::{ChatMessage, ChatRole};
 
     fn sample_response() -> ChatResponse {
         ChatResponse {
@@ -105,12 +119,17 @@ mod tests {
     }
 
     #[test]
-    fn computes_durations_overhead_and_tokens_per_second() {
+    fn computes_durations_overhead_ttft_and_tokens_per_second() {
         let resp = sample_response();
-        let metrics = InferenceMetrics::from_chat_response(&resp, Duration::from_millis(1_535));
+        let metrics = InferenceMetrics::from_chat_response_with_ttft(
+            &resp,
+            Duration::from_millis(1_535),
+            Some(420),
+        );
 
         assert_eq!(metrics.total_duration_ms, 1_500);
         assert_eq!(metrics.worker_overhead_ms, 35);
+        assert_eq!(metrics.ttft_ms, Some(420));
         assert_eq!(metrics.load_duration_ms, 200);
         assert_eq!(metrics.prompt_eval_duration_ms, 250);
         assert_eq!(metrics.eval_duration_ms, 1_000);
@@ -127,9 +146,9 @@ mod tests {
         resp.prompt_eval_duration = Some(0);
         resp.eval_duration = None;
 
-        // Wall clock smaller than reported Ollama duration must saturate to 0.
         let metrics = InferenceMetrics::from_chat_response(&resp, Duration::from_millis(1_000));
         assert_eq!(metrics.worker_overhead_ms, 0);
+        assert_eq!(metrics.ttft_ms, None);
         assert_eq!(metrics.prompt_tokens_per_second, 0.0);
         assert_eq!(metrics.generation_tokens_per_second, 0.0);
     }

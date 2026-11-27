@@ -4,21 +4,22 @@
 //! metrics calculation, and non-executing output validation logic from the CLI
 //! entry point.
 
+pub mod client;
 pub mod config;
 pub mod error;
 pub mod metrics;
-pub mod ollama;
 pub mod prompt;
 pub mod task;
 pub mod validation;
 
+pub use client::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,
+    HttpOllamaClient, InstalledModel, ModelDetails, OllamaClient, OllamaOptions, RunningModel,
+    StreamedChatResponse, VersionResponse, model_matches,
+};
 pub use config::{InferenceOptions, WorkerConfig};
 pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
 pub use metrics::InferenceMetrics;
-pub use ollama::{
-    ChatMessage, ChatRequest, ChatResponse, ChatRole, HttpOllamaClient, InstalledModel,
-    ModelDetails, OllamaClient, OllamaOptions, RunningModel, VersionResponse, model_matches,
-};
 pub use prompt::{BuiltPrompt, PromptBuilder, detect_potential_secret, estimate_tokens};
 pub use task::{
     DEFAULT_SYSTEM_PROMPT, DryRunReport, HealthReport, OutputExpectation, OutputFormat,

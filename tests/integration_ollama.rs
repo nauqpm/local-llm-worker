@@ -387,3 +387,51 @@ async fn cli_binary_enforces_stdout_json_and_exit_code_contracts() {
     assert_eq!(health_json["status"], "ok");
     assert_eq!(health_json["ollama_version"], "0.6.2");
 }
+
+#[tokio::test]
+async fn streaming_chat_assembles_ndjson_records_ttft_and_rejects_partial_stream() {
+    let server = MockServer::start().await;
+    let ndjson_ok = concat!(
+        "{\"model\":\"qwen2.5-coder:3b\",\"message\":{\"role\":\"assistant\",\"content\":\"def \"},\"done\":false}\n",
+        "{\"model\":\"qwen2.5-coder:3b\",\"message\":{\"role\":\"assistant\",\"content\":\"ok(): return 1\"},\"done\":false}\n",
+        "{\"model\":\"qwen2.5-coder:3b\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"total_duration\":600000000,\"prompt_eval_count\":30,\"prompt_eval_duration\":100000000,\"eval_count\":12,\"eval_duration\":400000000}\n"
+    );
+
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(ndjson_ok, "application/x-ndjson"))
+        .mount(&server)
+        .await;
+
+    let mut req = TaskRequest::new("stream-001", "qwen2.5-coder:3b", "Write ok()");
+    req.options.stream = true;
+
+    let res = executor_for(&server.uri(), 10, false).execute(&req).await;
+    assert_eq!(res.status, TaskStatus::Success);
+    assert_eq!(res.exit_code(), 0);
+    assert_eq!(res.output.as_deref(), Some("def ok(): return 1"));
+    let metrics = res.metrics.expect("streaming metrics should exist");
+    assert!(metrics.ttft_ms.is_some());
+    assert_eq!(metrics.generated_tokens, 12);
+
+    // Partial/truncated stream without `done: true` must return ProtocolError (Exit 3).
+    let partial_server = MockServer::start().await;
+    let ndjson_partial = "{\"model\":\"qwen2.5-coder:3b\",\"message\":{\"role\":\"assistant\",\"content\":\"partial\"},\"done\":false}\n";
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(ndjson_partial, "application/x-ndjson"),
+        )
+        .mount(&partial_server)
+        .await;
+
+    let partial_res = executor_for(&partial_server.uri(), 10, false)
+        .execute(&req)
+        .await;
+    assert_eq!(partial_res.status, TaskStatus::Error);
+    assert_eq!(partial_res.exit_code(), 3);
+    assert_eq!(
+        partial_res.error.as_ref().map(|e| e.category),
+        Some(ErrorCategory::ProtocolError)
+    );
+}

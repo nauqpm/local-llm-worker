@@ -138,6 +138,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub keep_alive: Option<String>,
 
+    /// Enable streaming NDJSON inference to measure Time to First Token (TTFT).
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+
     /// Skip the pre-flight `/api/tags` model existence check.
     #[arg(long, default_value_t = false)]
     pub skip_model_check: bool,
@@ -402,6 +406,7 @@ fn resolve_task_request(args: &RunArgs) -> WorkerResult<TaskRequest> {
         max_tokens: args.max_tokens,
         seed: args.seed,
         keep_alive: args.keep_alive.clone(),
+        stream: args.stream,
     };
     request.options = request.options.merge_override(&cli_overrides);
 

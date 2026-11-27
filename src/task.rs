@@ -6,10 +6,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::client::{ChatRequest, InstalledModel, OllamaClient, RunningModel, model_matches};
 use crate::config::InferenceOptions;
 use crate::error::{ErrorDetail, WorkerError, WorkerResult, exit_codes};
 use crate::metrics::InferenceMetrics;
-use crate::ollama::{ChatRequest, InstalledModel, OllamaClient, RunningModel, model_matches};
 use crate::prompt::PromptBuilder;
 use crate::validation::OutputValidator;
 
@@ -494,12 +494,20 @@ impl<C: OllamaClient> TaskExecutor<C> {
         }
 
         let started = Instant::now();
-        let response = match self.client.chat(&chat_request).await {
-            Ok(resp) => resp,
-            Err(err) => return TaskResult::from_error(task_id, model, &err),
+        let (response, ttft_ms) = if request.options.stream {
+            match self.client.chat_stream(&chat_request).await {
+                Ok(streamed) => (streamed.response, streamed.ttft_ms),
+                Err(err) => return TaskResult::from_error(task_id, model, &err),
+            }
+        } else {
+            match self.client.chat(&chat_request).await {
+                Ok(resp) => (resp, None),
+                Err(err) => return TaskResult::from_error(task_id, model, &err),
+            }
         };
         let wall_clock = started.elapsed();
-        let metrics = InferenceMetrics::from_chat_response(&response, wall_clock);
+        let metrics =
+            InferenceMetrics::from_chat_response_with_ttft(&response, wall_clock, ttft_ms);
 
         let raw_content = response.message.content;
         let outcome = OutputValidator::validate(
@@ -557,8 +565,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::client::{
+        ChatMessage, ChatResponse, ChatRole, GenerateRequest, GenerateResponse,
+        StreamedChatResponse, VersionResponse,
+    };
     use crate::error::ErrorCategory;
-    use crate::ollama::{ChatMessage, ChatResponse, ChatRole, VersionResponse};
 
     struct FakeOllamaClient {
         installed: Vec<InstalledModel>,
@@ -622,6 +633,30 @@ mod tests {
                     message: "connection refused".into(),
                 }),
             }
+        }
+
+        async fn chat_stream(&self, request: &ChatRequest) -> WorkerResult<StreamedChatResponse> {
+            let response = self.chat(request).await?;
+            Ok(StreamedChatResponse {
+                response,
+                ttft_ms: Some(12),
+            })
+        }
+
+        async fn generate(&self, _request: &GenerateRequest) -> WorkerResult<GenerateResponse> {
+            Ok(GenerateResponse {
+                model: "qwen2.5-coder:3b".into(),
+                created_at: None,
+                response: "ok".into(),
+                done: true,
+                done_reason: Some("stop".into()),
+                total_duration: Some(100_000_000),
+                load_duration: Some(0),
+                prompt_eval_count: Some(10),
+                prompt_eval_duration: Some(50_000_000),
+                eval_count: Some(5),
+                eval_duration: Some(50_000_000),
+            })
         }
     }
 

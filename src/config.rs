@@ -163,6 +163,9 @@ pub struct InferenceOptions {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<String>,
+
+    #[serde(default)]
+    pub stream: bool,
 }
 
 impl Default for InferenceOptions {
@@ -173,6 +176,7 @@ impl Default for InferenceOptions {
             max_tokens: Some(DEFAULT_MAX_TOKENS),
             seed: None,
             keep_alive: None,
+            stream: false,
         }
     }
 }
@@ -229,6 +233,7 @@ impl InferenceOptions {
                 .keep_alive
                 .clone()
                 .or_else(|| self.keep_alive.clone()),
+            stream: overrides.stream || self.stream,
         }
     }
 }
@@ -389,6 +394,7 @@ mod tests {
             max_tokens: None,
             seed: Some(42),
             keep_alive: Some("5m".into()),
+            stream: true,
         };
         let merged = base.merge_override(&overrides);
         assert_eq!(merged.temperature, Some(0.0));
@@ -396,6 +402,7 @@ mod tests {
         assert_eq!(merged.max_tokens, Some(512));
         assert_eq!(merged.seed, Some(42));
         assert_eq!(merged.keep_alive.as_deref(), Some("5m"));
+        assert!(merged.stream);
         merged.validate().expect("merged options should be valid");
     }
 
