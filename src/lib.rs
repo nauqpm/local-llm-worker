@@ -4,6 +4,12 @@
 //! metrics calculation, and non-executing output validation logic from the CLI
 //! entry point.
 
+pub mod config;
+pub mod error;
+
+pub use config::{InferenceOptions, WorkerConfig};
+pub use error::{ErrorCategory, ErrorDetail, WorkerError, WorkerResult};
+
 /// Default loopback base URL for a local Ollama server.
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 
