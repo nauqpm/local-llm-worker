@@ -1,13 +1,21 @@
+use std::fs::{self, File};
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::str::FromStr;
 
 use clap::{Args, Parser, Subcommand};
 use ollama_worker::{
     DEFAULT_OLLAMA_BASE_URL, DEFAULT_TIMEOUT_SECS, ErrorDetail, HttpOllamaClient, InferenceOptions,
-    InstalledModel, TaskExecutor, TaskRequest, TaskResult, WorkerConfig, WorkerError,
+    InstalledModel, TaskExecutor, TaskRequest, TaskResult, TaskType, WorkerConfig, WorkerError,
+    WorkerResult,
 };
 use serde::Serialize;
 
 const DEFAULT_CLI_TASK_ID: &str = "cli-task";
+
+/// Hard upper bound (1 MiB) for `--input` files and `--stdin` payloads.
+const MAX_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,7 +46,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub allow_remote_ollama: bool,
 
-    /// Pretty-print JSON output on stdout.
+    /// Pretty-print JSON output on stdout and --output files.
     #[arg(long, global = true, default_value_t = false)]
     pub pretty: bool,
 
@@ -66,19 +74,47 @@ pub enum Commands {
 
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Target Ollama model name (e.g., qwen2.5-coder:3b).
-    #[arg(long, env = "OLLAMA_WORKER_MODEL")]
-    pub model: Option<String>,
+    /// Path to a JSON task file (mutually exclusive with --task and --stdin).
+    #[arg(long, conflicts_with_all = ["task", "stdin"])]
+    pub input: Option<PathBuf>,
+
+    /// Read a JSON task payload from stdin (mutually exclusive with --input and --task).
+    #[arg(long, default_value_t = false, conflicts_with_all = ["input", "task"])]
+    pub stdin: bool,
 
     /// Inline task instruction for quick CLI invocations.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["input", "stdin"])]
     pub task: Option<String>,
 
-    /// Task identifier included in the structured JSON result.
-    #[arg(long, default_value = DEFAULT_CLI_TASK_ID)]
-    pub task_id: String,
+    /// Optional file path to write the structured JSON output.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
 
-    /// Optional custom system prompt overriding the built-in concise default.
+    /// Suppress stdout JSON when --output is used.
+    #[arg(long, default_value_t = false, requires = "output")]
+    pub quiet: bool,
+
+    /// Validate input, build prompt, and estimate tokens without calling Ollama.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Target Ollama model name (overrides Task JSON; falls back to OLLAMA_WORKER_MODEL).
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Task type (freeform, generate_function, generate_unit_test, generate_docstring, explain_code, refactor_function, fix_bug, generate_json).
+    #[arg(long = "type")]
+    pub task_type: Option<String>,
+
+    /// Target programming language for inline tasks or overrides.
+    #[arg(long = "lang")]
+    pub language: Option<String>,
+
+    /// Task identifier (overrides Task JSON; defaults to "cli-task" for inline tasks).
+    #[arg(long)]
+    pub task_id: Option<String>,
+
+    /// Optional custom system prompt overriding the built-in task template.
     #[arg(long)]
     pub system: Option<String>,
 
@@ -175,7 +211,7 @@ async fn run_health(
     match executor.health(config.base_url_str()).await {
         Ok(report) => {
             if json_output {
-                emit_json(&report, pretty)
+                emit_json_stdout(&report, pretty)
             } else {
                 println!(
                     "Ollama OK (version {}, endpoint {})",
@@ -217,7 +253,7 @@ async fn run_models(
     match executor.models().await {
         Ok(models) => {
             if json_output {
-                emit_json(&ModelsOutput { models }, pretty)
+                emit_json_stdout(&ModelsOutput { models }, pretty)
             } else if models.is_empty() {
                 println!("No models installed.");
                 ExitCode::SUCCESS
@@ -255,64 +291,234 @@ async fn run_task(
     args: RunArgs,
     pretty: bool,
 ) -> ExitCode {
-    let requested_model = args.model.clone().unwrap_or_default();
-    let config =
-        match WorkerConfig::new(&base_url, timeout, allow_remote_ollama, args.model.clone()) {
-            Ok(cfg) => cfg.with_verify_model(!args.skip_model_check),
-            Err(err) => {
-                let result = TaskResult::from_error(&args.task_id, &requested_model, &err);
-                return emit_task_result(&result, pretty);
-            }
-        };
+    let fallback_task_id = args
+        .task_id
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CLI_TASK_ID.to_owned());
+    let fallback_model = args.model.clone().unwrap_or_default();
+    let output_path = args.output.clone();
+    let quiet = args.quiet;
 
-    let Some(model) = args.model.filter(|m| !m.trim().is_empty()) else {
-        let err = WorkerError::InvalidInput {
-            message: "missing required --model (or OLLAMA_WORKER_MODEL)".into(),
-        };
-        let result = TaskResult::from_error(&args.task_id, "", &err);
-        return emit_task_result(&result, pretty);
+    let config = match WorkerConfig::new(&base_url, timeout, allow_remote_ollama, None) {
+        Ok(cfg) => cfg.with_verify_model(!args.skip_model_check),
+        Err(err) => {
+            let result = TaskResult::from_error(&fallback_task_id, &fallback_model, &err);
+            return emit_task_result(&result, output_path.as_deref(), quiet, pretty);
+        }
     };
 
-    let Some(instruction) = args.task.filter(|t| !t.trim().is_empty()) else {
-        let err = WorkerError::InvalidInput {
-            message: "missing required --task instruction".into(),
-        };
-        let result = TaskResult::from_error(&args.task_id, &model, &err);
-        return emit_task_result(&result, pretty);
+    let request = match resolve_task_request(&args) {
+        Ok(req) => req,
+        Err(err) => {
+            let result = TaskResult::from_error(&fallback_task_id, &fallback_model, &err);
+            return emit_task_result(&result, output_path.as_deref(), quiet, pretty);
+        }
     };
-
-    let overrides = InferenceOptions {
-        temperature: args.temperature,
-        num_ctx: args.num_ctx,
-        max_tokens: args.max_tokens,
-        seed: args.seed,
-        keep_alive: args.keep_alive,
-    };
-    let options = InferenceOptions::default().merge_override(&overrides);
-
-    let mut request = TaskRequest::new(args.task_id, model, instruction);
-    request.system_prompt = args.system;
-    request.options = options;
 
     let client = match HttpOllamaClient::new(config.clone()) {
         Ok(c) => c,
         Err(err) => {
             let result = TaskResult::from_error(&request.task_id, &request.model, &err);
-            return emit_task_result(&result, pretty);
+            return emit_task_result(&result, output_path.as_deref(), quiet, pretty);
         }
     };
 
     let executor = TaskExecutor::new(client, config.verify_model());
+
+    if args.dry_run {
+        return match executor.dry_run(&request) {
+            Ok(report) => emit_payload(&report, output_path.as_deref(), quiet, pretty, 0),
+            Err(err) => {
+                let result = TaskResult::from_error(&request.task_id, &request.model, &err);
+                emit_task_result(&result, output_path.as_deref(), quiet, pretty)
+            }
+        };
+    }
+
     let result = executor.execute(&request).await;
-    emit_task_result(&result, pretty)
+    emit_task_result(&result, output_path.as_deref(), quiet, pretty)
 }
 
-fn emit_task_result(result: &TaskResult, pretty: bool) -> ExitCode {
-    let code = emit_json(result, pretty);
-    if code != ExitCode::SUCCESS {
-        return code;
+fn resolve_task_request(args: &RunArgs) -> WorkerResult<TaskRequest> {
+    let env_model = std::env::var("OLLAMA_WORKER_MODEL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+
+    let mut request = if let Some(path) = &args.input {
+        let raw = read_limited_file(path, MAX_INPUT_BYTES)?;
+        parse_task_json(&raw)?
+    } else if args.stdin {
+        let raw = read_limited_reader(io::stdin().lock(), MAX_INPUT_BYTES, "stdin")?;
+        parse_task_json(&raw)?
+    } else if let Some(instruction) = &args.task {
+        let model = args
+            .model
+            .clone()
+            .or(env_model.clone())
+            .filter(|m| !m.trim().is_empty())
+            .ok_or_else(|| WorkerError::InvalidInput {
+                message: "missing required --model (or OLLAMA_WORKER_MODEL)".into(),
+            })?;
+        let task_id = args
+            .task_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CLI_TASK_ID.to_owned());
+        TaskRequest::new(task_id, model, instruction)
+    } else {
+        return Err(WorkerError::InvalidInput {
+            message: "provide one of --input <FILE>, --stdin, or --task <INSTRUCTION>".into(),
+        });
+    };
+
+    // Precedence: CLI Flags > Task JSON > Env > Built-in Defaults.
+    if let Some(model) = &args.model {
+        request.model = model.clone();
+    } else if request.model.trim().is_empty()
+        && let Some(env_m) = env_model
+    {
+        request.model = env_m;
     }
-    ExitCode::from(result.exit_code())
+
+    if let Some(task_id) = &args.task_id {
+        request.task_id = task_id.clone();
+    }
+
+    if let Some(raw_type) = &args.task_type {
+        request.task_type = TaskType::from_str(raw_type)?;
+    }
+
+    if let Some(lang) = &args.language {
+        request.language = Some(lang.clone());
+    }
+
+    if let Some(system) = &args.system {
+        request.system_prompt = Some(system.clone());
+    }
+
+    let cli_overrides = InferenceOptions {
+        temperature: args.temperature,
+        num_ctx: args.num_ctx,
+        max_tokens: args.max_tokens,
+        seed: args.seed,
+        keep_alive: args.keep_alive.clone(),
+    };
+    request.options = request.options.merge_override(&cli_overrides);
+
+    Ok(request)
+}
+
+fn parse_task_json(raw: &str) -> WorkerResult<TaskRequest> {
+    if raw.trim().is_empty() {
+        return Err(WorkerError::InvalidInput {
+            message: "task JSON input is empty".into(),
+        });
+    }
+    serde_json::from_str::<TaskRequest>(raw).map_err(|err| WorkerError::InvalidInput {
+        message: format!("failed to parse task JSON: {err}"),
+    })
+}
+
+fn read_limited_file(path: &Path, max_bytes: usize) -> WorkerResult<String> {
+    let metadata = fs::metadata(path).map_err(|err| WorkerError::InvalidInput {
+        message: format!("cannot access input file '{}': {err}", path.display()),
+    })?;
+    if !metadata.is_file() {
+        return Err(WorkerError::InvalidInput {
+            message: format!("input path '{}' is not a regular file", path.display()),
+        });
+    }
+    if metadata.len() > max_bytes as u64 {
+        return Err(WorkerError::InvalidInput {
+            message: format!(
+                "input file '{}' exceeds maximum allowed size of {max_bytes} bytes",
+                path.display()
+            ),
+        });
+    }
+
+    let file = File::open(path).map_err(|err| WorkerError::InvalidInput {
+        message: format!("failed to open input file '{}': {err}", path.display()),
+    })?;
+    read_limited_reader(file, max_bytes, &path.display().to_string())
+}
+
+fn read_limited_reader<R: Read>(reader: R, max_bytes: usize, label: &str) -> WorkerResult<String> {
+    let mut limited = reader.take((max_bytes as u64) + 1);
+    let mut buffer = Vec::new();
+    limited
+        .read_to_end(&mut buffer)
+        .map_err(|err| WorkerError::InvalidInput {
+            message: format!("failed to read {label}: {err}"),
+        })?;
+    if buffer.len() > max_bytes {
+        return Err(WorkerError::InvalidInput {
+            message: format!("{label} exceeds maximum allowed size of {max_bytes} bytes"),
+        });
+    }
+    String::from_utf8(buffer).map_err(|err| WorkerError::InvalidInput {
+        message: format!("{label} is not valid UTF-8: {err}"),
+    })
+}
+
+fn write_output_file(path: &Path, contents: &str) -> WorkerResult<()> {
+    if path.is_dir() {
+        return Err(WorkerError::InvalidInput {
+            message: format!("output path '{}' is a directory", path.display()),
+        });
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        return Err(WorkerError::InvalidInput {
+            message: format!(
+                "parent directory '{}' for --output does not exist",
+                parent.display()
+            ),
+        });
+    }
+    fs::write(path, contents).map_err(|err| WorkerError::Internal {
+        message: format!("failed to write output file '{}': {err}", path.display()),
+    })
+}
+
+fn emit_task_result(
+    result: &TaskResult,
+    output_path: Option<&Path>,
+    quiet: bool,
+    pretty: bool,
+) -> ExitCode {
+    emit_payload(result, output_path, quiet, pretty, result.exit_code())
+}
+
+fn emit_payload<T: Serialize>(
+    value: &T,
+    output_path: Option<&Path>,
+    quiet: bool,
+    pretty: bool,
+    exit_code: u8,
+) -> ExitCode {
+    let rendered = match render_json(value, pretty) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("error: failed to serialize JSON output: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    if let Some(path) = output_path
+        && let Err(err) = write_output_file(path, &format!("{rendered}\n"))
+    {
+        eprintln!("error: {err}");
+        return ExitCode::from(err.exit_code());
+    }
+
+    if !quiet {
+        println!("{rendered}");
+    }
+
+    ExitCode::from(exit_code)
 }
 
 fn emit_command_error(err: &WorkerError, json_output: bool, pretty: bool) -> ExitCode {
@@ -321,21 +527,15 @@ fn emit_command_error(err: &WorkerError, json_output: bool, pretty: bool) -> Exi
             status: "error",
             error: err.to_detail(),
         };
-        let _ = emit_json(&payload, pretty);
+        let _ = emit_json_stdout(&payload, pretty);
     } else {
         eprintln!("error: {err}");
     }
     ExitCode::from(err.exit_code())
 }
 
-fn emit_json<T: Serialize>(value: &T, pretty: bool) -> ExitCode {
-    let rendered = if pretty {
-        serde_json::to_string_pretty(value)
-    } else {
-        serde_json::to_string(value)
-    };
-
-    match rendered {
+fn emit_json_stdout<T: Serialize>(value: &T, pretty: bool) -> ExitCode {
+    match render_json(value, pretty) {
         Ok(text) => {
             println!("{text}");
             ExitCode::SUCCESS
@@ -344,6 +544,14 @@ fn emit_json<T: Serialize>(value: &T, pretty: bool) -> ExitCode {
             eprintln!("error: failed to serialize JSON output: {err}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn render_json<T: Serialize>(value: &T, pretty: bool) -> Result<String, serde_json::Error> {
+    if pretty {
+        serde_json::to_string_pretty(value)
+    } else {
+        serde_json::to_string(value)
     }
 }
 
@@ -369,6 +577,10 @@ mod tests {
             "run",
             "--model",
             "qwen2.5-coder:3b",
+            "--type",
+            "generate_function",
+            "--lang",
+            "python",
             "--task",
             "Write is_prime in Python",
             "--task-id",
@@ -382,6 +594,7 @@ mod tests {
             "--seed",
             "7",
             "--skip-model-check",
+            "--dry-run",
         ])
         .expect("CLI should parse valid run arguments");
 
@@ -393,16 +606,30 @@ mod tests {
         match cli.command {
             Commands::Run(args) => {
                 assert_eq!(args.model.as_deref(), Some("qwen2.5-coder:3b"));
+                assert_eq!(args.task_type.as_deref(), Some("generate_function"));
+                assert_eq!(args.language.as_deref(), Some("python"));
                 assert_eq!(args.task.as_deref(), Some("Write is_prime in Python"));
-                assert_eq!(args.task_id, "task-042");
+                assert_eq!(args.task_id.as_deref(), Some("task-042"));
                 assert_eq!(args.temperature, Some(0.2));
                 assert_eq!(args.max_tokens, Some(256));
                 assert_eq!(args.num_ctx, Some(4096));
                 assert_eq!(args.seed, Some(7));
                 assert!(args.skip_model_check);
+                assert!(args.dry_run);
             }
             other => panic!("expected Run command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cli_enforces_mutually_exclusive_task_input_sources() {
+        let conflict =
+            Cli::try_parse_from(["ollama-worker", "run", "--input", "task.json", "--stdin"]);
+        assert!(conflict.is_err());
+
+        let quiet_without_output =
+            Cli::try_parse_from(["ollama-worker", "run", "--stdin", "--quiet"]);
+        assert!(quiet_without_output.is_err());
     }
 
     #[test]
@@ -420,5 +647,13 @@ mod tests {
         assert!(cli.allow_remote_ollama);
         assert_eq!(cli.base_url, "http://100.64.0.10:11434");
         assert!(matches!(cli.command, Commands::Health { json: true }));
+    }
+
+    #[test]
+    fn limited_reader_rejects_oversized_payload() {
+        let oversized = [b'a'; 64];
+        let err = read_limited_reader(&oversized[..], 32, "stdin")
+            .expect_err("payload over limit must fail");
+        assert_eq!(err.exit_code(), 2);
     }
 }
