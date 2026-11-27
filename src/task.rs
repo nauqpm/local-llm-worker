@@ -10,6 +10,7 @@ use crate::config::InferenceOptions;
 use crate::error::{ErrorDetail, WorkerError, WorkerResult, exit_codes};
 use crate::metrics::InferenceMetrics;
 use crate::ollama::{ChatRequest, InstalledModel, OllamaClient, RunningModel, model_matches};
+use crate::prompt::PromptBuilder;
 
 /// Current structured schema version emitted in task requests and results.
 pub const SCHEMA_VERSION: &str = "1";
@@ -348,6 +349,21 @@ impl TaskResult {
     }
 }
 
+/// Preview returned by `--dry-run` without contacting Ollama.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DryRunReport {
+    pub schema_version: String,
+    pub task_id: String,
+    pub model: String,
+    pub task_type: TaskType,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub estimated_prompt_tokens: usize,
+    pub context_budget_tokens: usize,
+    pub ollama_json_format_enabled: bool,
+    pub warnings: Vec<String>,
+}
+
 /// Structured server health snapshot returned by the `health` command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthReport {
@@ -357,21 +373,30 @@ pub struct HealthReport {
     pub running_models: Vec<RunningModel>,
 }
 
-/// Coordinates validation, model verification, Ollama inference, and metrics.
+/// Coordinates validation, prompt building, model verification, Ollama inference, and metrics.
 #[derive(Debug, Clone)]
 pub struct TaskExecutor<C> {
     client: C,
     verify_model: bool,
+    prompt_builder: PromptBuilder,
 }
 
 impl<C: OllamaClient> TaskExecutor<C> {
     /// Creates a new executor backed by any [`OllamaClient`] implementation.
     #[must_use]
-    pub const fn new(client: C, verify_model: bool) -> Self {
+    pub fn new(client: C, verify_model: bool) -> Self {
         Self {
             client,
             verify_model,
+            prompt_builder: PromptBuilder::default(),
         }
+    }
+
+    /// Overrides the [`PromptBuilder`] used for token budget calculation.
+    #[must_use]
+    pub const fn with_prompt_builder(mut self, prompt_builder: PromptBuilder) -> Self {
+        self.prompt_builder = prompt_builder;
+        self
     }
 
     /// Checks Ollama liveness (`/api/version`) and currently loaded models (`/api/ps`).
@@ -392,6 +417,29 @@ impl<C: OllamaClient> TaskExecutor<C> {
         self.client.list_models().await
     }
 
+    /// Validates a task and renders the prompt + token estimate without calling Ollama.
+    pub fn dry_run(&self, request: &TaskRequest) -> WorkerResult<DryRunReport> {
+        request.validate()?;
+        let built = self.prompt_builder.build(request)?;
+        let json_format_enabled = request
+            .output_expectation
+            .effective_format(request.task_type)
+            == OutputFormat::Json;
+
+        Ok(DryRunReport {
+            schema_version: SCHEMA_VERSION.to_owned(),
+            task_id: request.task_id.trim().to_owned(),
+            model: request.model.trim().to_owned(),
+            task_type: request.task_type,
+            system_prompt: built.system_prompt,
+            user_prompt: built.user_prompt,
+            estimated_prompt_tokens: built.estimated_prompt_tokens,
+            context_budget_tokens: built.context_budget_tokens,
+            ollama_json_format_enabled: json_format_enabled,
+            warnings: built.warnings,
+        })
+    }
+
     /// Executes a single task and always produces a structured [`TaskResult`].
     pub async fn execute(&self, request: &TaskRequest) -> TaskResult {
         if let Err(err) = request.validate() {
@@ -400,6 +448,11 @@ impl<C: OllamaClient> TaskExecutor<C> {
 
         let model = request.model.trim();
         let task_id = request.task_id.trim();
+
+        let built = match self.prompt_builder.build(request) {
+            Ok(prompt) => prompt,
+            Err(err) => return TaskResult::from_error(task_id, model, &err),
+        };
 
         if self.verify_model {
             match self.client.list_models().await {
@@ -415,17 +468,25 @@ impl<C: OllamaClient> TaskExecutor<C> {
             }
         }
 
-        let system_prompt = request
-            .system_prompt
-            .as_deref()
-            .unwrap_or(DEFAULT_SYSTEM_PROMPT);
-
-        let chat_request = ChatRequest::stateless(
+        let mut chat_request = ChatRequest::stateless(
             model,
-            Some(system_prompt),
-            request.instruction.trim(),
+            Some(&built.system_prompt),
+            &built.user_prompt,
             &request.options,
         );
+
+        if request
+            .output_expectation
+            .effective_format(request.task_type)
+            == OutputFormat::Json
+        {
+            let format = request
+                .output_expectation
+                .json_schema
+                .clone()
+                .unwrap_or_else(|| Value::String("json".to_owned()));
+            chat_request = chat_request.with_format(format);
+        }
 
         let started = Instant::now();
         let response = match self.client.chat(&chat_request).await {
@@ -448,7 +509,7 @@ impl<C: OllamaClient> TaskExecutor<C> {
                     "non_empty",
                     "model returned an empty response",
                 )],
-                warnings: Vec::new(),
+                warnings: built.warnings,
             };
             return TaskResult {
                 schema_version: SCHEMA_VERSION.to_owned(),
@@ -468,7 +529,7 @@ impl<C: OllamaClient> TaskExecutor<C> {
             passed: true,
             extracted_code_block: false,
             checks: vec![ValidationCheck::pass("non_empty")],
-            warnings: Vec::new(),
+            warnings: built.warnings,
         };
 
         TaskResult {
