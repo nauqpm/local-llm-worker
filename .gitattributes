@@ -1,0 +1,5 @@
+# Normalize text files to LF across Windows and Linux workspaces
+* text=auto eol=lf
+
+# Guarantee Unix LF line endings for shell scripts executed on Linux hosts
+*.sh text eol=lf

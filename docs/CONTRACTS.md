@@ -61,6 +61,7 @@ The result distinguishes **generation success** from **validation success** and 
   },
   "metrics": {
     "worker_overhead_ms": 0,
+    "ttft_ms": null,
     "total_duration_ms": 0,
     "load_duration_ms": 0,
     "prompt_eval_duration_ms": 0,
@@ -85,13 +86,13 @@ The result distinguishes **generation success** from **validation success** and 
 ## 3. CLI Interface (`ollama-worker`)
 
 ```bash
-ollama-worker health [--json] [--base-url URL]
-ollama-worker models [--json] [--verbose]
-ollama-worker run --model qwen2.5-coder:3b --task "Write a Python function to check prime numbers"
-ollama-worker run --input task.json [--output result.json]
-cat task.json | ollama-worker run --stdin
-ollama-worker run --input task.json --dry-run
-ollama-worker benchmark --model qwen2.5-coder:3b
+ollama-worker health [--json] [--base-url URL] [--allow-remote-ollama] [--pretty]
+ollama-worker models [--json] [--base-url URL] [--pretty]
+ollama-worker run --model qwen2.5-coder:3b --type generate_function --lang python --task "Write is_prime"
+ollama-worker run --input task.json [--output result.json] [--quiet] [--stream] [--pretty]
+cat task.json | ollama-worker run --stdin [--stream]
+ollama-worker run --input task.json --dry-run [--pretty]
+ollama-worker benchmark --model qwen2.5-coder:3b [--suite FILE] [--endpoint chat|generate|both] [--stream] [--cold-start] [--iterations N]
 ```
 
 ### Stream Separation & Exit Codes
@@ -130,9 +131,9 @@ Supported environment variables:
 | `/api/version` | `GET` | Lightweight server liveness and version check | M1 |
 | `/api/tags` | `GET` | List installed models and verify model existence | M1 |
 | `/api/ps` | `GET` | Inspect currently loaded models and memory usage | M1 / M3 |
-| `/api/chat` | `POST` | Primary stateless 2-message (`system` + `user`) inference without `tools` | M1–M2 |
-| `/api/show` | `POST` | Inspect model template, capabilities, and context metadata | M2 |
-| `/api/generate` | `POST` | Benchmark comparison against `/api/chat` and future FIM (`suffix`) support | M3 |
+| `/api/chat` | `POST` | Primary stateless 2-message (`system` + `user`) inference without `tools` (non-streaming & NDJSON streaming) | M1–M3 |
+| `/api/generate` | `POST` | Benchmark comparison against `/api/chat`, cold-start unload (`keep_alive: "0"`), and future FIM (`suffix`) | M3 |
+| `/api/show` | `POST` | Optional future enhancement for verbose model metadata inspection | Future |
 
 ### Per-Request Inference Defaults (CPU 3B Model)
 
