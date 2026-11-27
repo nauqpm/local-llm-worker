@@ -44,7 +44,7 @@
 ### M0 — Research and Architecture *(Completed)*
 - Requirements analysis, LoopForge `v0.4.3` source inspection, Ollama API & crate verification, architecture design, ADRs, and user approval.
 
-### M1 — Minimum Viable Worker *(In Progress)*
+### M1 — Minimum Viable Worker *(Completed)*
 - `M1.1`: Git initialization, dual licenses, consolidated `docs/`, `Cargo.toml`, `lib`/`bin` skeleton, CI workflow.
 - `M1.2`: Typed `error.rs` (with exit codes) and `config.rs` (env/CLI precedence + loopback guard).
 - `M1.3`: `ollama.rs` (`OllamaClient` trait + `reqwest` implementation for `/api/version`, `/api/tags`, `/api/ps`, `/api/chat`).
