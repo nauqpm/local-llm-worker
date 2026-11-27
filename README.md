@@ -8,7 +8,8 @@ A lightweight, resource-efficient, strongly typed Local LLM Worker written in Ru
 
 - **Low overhead:** Single-shot Rust CLI with minimal RAM footprint and no background daemon required.
 - **Native Ollama API:** Communicates directly with Ollama (`/api/version`, `/api/tags`, `/api/ps`, `/api/chat`) to preserve nanosecond inference metrics and per-request inference controls.
-- **Deterministic contracts:** Structured JSON on `stdout`, structured logs on `stderr`, and explicit process exit codes (`0, 1, 2, 3, 4, 5, 6, 130`).
+- **Deterministic contracts:** Structured JSON on `stdout`, structured logs on `stderr`, and explicit process exit codes (`0, 1, 2, 3, 4, 5, 6, 7, 130`).
+- **Sequential batch execution (v0.2.0):** Execute independent coding tasks strictly sequentially (`concurrency = 1`) via `ollama-worker batch`, reusing the single-task pipeline with failure isolation, `--fail-fast`, per-task/batch timeouts, `SIGINT`/`SIGTERM` cancellation, and atomic incremental `--output` persistence.
 - **Context & secret safety:** Estimates prompt size against the configured context budget without silent truncation, blocks non-loopback endpoints unless explicitly opted in (`--allow-remote-ollama`), and checks for common accidental secret patterns before sending prompts.
 - **Strict security boundary:** Never executes generated code or shell commands; performs static, non-executing output validation (non-empty, truncation check, markdown code fence extraction, max length, JSON & JSON Schema).
 - **Reusable core:** Clean separation between the `ollama_worker` library crate (`src/lib.rs`) and the `ollama-worker` CLI binary (`src/main.rs`).
@@ -40,6 +41,12 @@ ollama-worker run --input examples/tasks/prime_function.json --stream --pretty
 # Pipe a task from stdin (convenient for Codex / automation)
 cat examples/tasks/structured_json.json | ollama-worker run --stdin
 
+# Validate a sequential batch offline (zero Ollama calls)
+ollama-worker batch --input examples/batches/python_utils_batch.json --dry-run --pretty
+
+# Run a sequential batch (concurrency = 1) with atomic incremental result persistence
+ollama-worker batch --input examples/batches/python_utils_batch.json --output batch_result.json --pretty
+
 # Run the built-in reproducible benchmark suite (S1 Small / S2 Medium / S3 Large)
 ollama-worker benchmark --model qwen2.5-coder:3b --stream --iterations 2 --pretty
 ```
@@ -53,6 +60,7 @@ OLLAMA_LIVE_TEST=1 cargo test --test live_ollama -- --ignored --nocapture
 ## Examples & Documentation
 
 - Task fixtures: [examples/tasks/](examples/tasks/)
+- Sequential batch fixtures: [examples/batches/](examples/batches/)
 - Standalone Codex delegation template: [examples/codex/DELEGATION_RULES.md](examples/codex/DELEGATION_RULES.md)
 - [Architecture & Requirements](docs/ARCHITECTURE.md)
 - [Task Schema, CLI & Ollama Contracts](docs/CONTRACTS.md)

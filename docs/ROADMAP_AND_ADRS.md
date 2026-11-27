@@ -37,6 +37,12 @@
 - **Status:** Accepted
 - **Decision:** Use standard Rust dual licensing (`MIT OR Apache-2.0`) and 7 cohesive documents in `docs/`.
 
+### ADR-007: Strictly Sequential Batch Execution (`v0.2.0`) Reusing `TaskExecutor`
+
+- **Status:** Accepted
+- **Decision:** Add `ollama-worker batch` backed by `BatchExecutor<C>` with hardcoded `concurrency = 1`, versioned `BatchTask`/`BatchResult` v1 schemas, cached per-batch `/api/tags` checks, failure isolation + `--fail-fast`, per-task/overall timeouts, pinned-future `SIGINT`/`SIGTERM` cancellation, and atomic incremental `--output` persistence, without adding new crate dependencies or modifying `TaskStatus`.
+- **Rationale:** Matches CPU-only Ollama hardware constraints (`i5-1135G7`, 8 GB RAM, `qwen2.5-coder:3b`), eliminates multi-agent cloud orchestration overhead while preserving ~1–2 ms worker overhead, preserves 100% v0.1.0 backward compatibility, and preserves static `x86_64-unknown-linux-musl` release builds.
+
 ---
 
 ## 2. Milestone Roadmap
@@ -67,6 +73,12 @@
 - `M3.4` *(Done)*: `benchmark` subcommand and reproducible `benchmarks/` scripts (`curl` vs `ollama-worker` vs OpenCode).
 - `M3.5` *(Done)*: GitHub Actions `release.yml` for static `x86_64-unknown-linux-musl` binaries + `SHA256SUMS.txt`.
 - `M3.6` *(Pending User Approval / Home Server Run)*: Run empirical benchmarks on Home Server and document measured findings.
+
+### v0.2.0 — Sequential Batch Inference *(Completed)*
+- Versioned `BatchTask`, `BatchResult`, and `BatchDryRunReport` (`schema_version = "1"`) contracts preserving 100% v0.1.0 compatibility.
+- Strictly sequential (`concurrency = 1`) `BatchExecutor` reusing `TaskExecutor` with lazy `/api/tags` caching and aggregated batch telemetry (`BatchSummary`, `BatchMetrics`).
+- Failure isolation (`fail_fast = false`), `--fail-fast`, per-task and overall `batch_timeout_secs`, `SIGINT`/`SIGTERM` cancellation preserving completed results, and atomic incremental `--output` checkpoints.
+- Full offline `wiremock` + CLI subprocess integration tests (`tests/integration_batch.rs`), example batch fixture (`examples/batches/python_utils_batch.json`), and opt-in live Ollama batch test.
 
 ### M4 — LoopForge Integration
 - `M4.1`: Verify Runner `v0.13.2` Native Sandbox environment (`PATH`, env vars, `127.0.0.1:11434`).

@@ -8,7 +8,9 @@
 //! ```
 
 use ollama_worker::{
-    DEFAULT_OLLAMA_BASE_URL, HttpOllamaClient, TaskExecutor, TaskRequest, TaskStatus, WorkerConfig,
+    BatchExecutor, BatchRuntimeOverrides, BatchStatus, BatchTask, BatchTaskItem,
+    DEFAULT_OLLAMA_BASE_URL, HttpOllamaClient, TaskExecutor, TaskRequest, TaskStatus, TaskType,
+    WorkerConfig,
 };
 
 fn live_test_enabled() -> bool {
@@ -81,4 +83,50 @@ async fn live_run_simple_python_task() {
     let metrics = result.metrics.expect("live metrics should be present");
     assert!(metrics.prompt_tokens > 0);
     assert!(metrics.generated_tokens > 0);
+}
+
+#[tokio::test]
+#[ignore = "opt-in live test; set OLLAMA_LIVE_TEST=1 and run with --ignored"]
+async fn live_batch_three_python_utility_functions() {
+    if !live_test_enabled() {
+        eprintln!("skipping live test: set OLLAMA_LIVE_TEST=1 to enable");
+        return;
+    }
+
+    let model =
+        std::env::var("OLLAMA_WORKER_MODEL").unwrap_or_else(|_| "qwen2.5-coder:3b".to_owned());
+    let (task_executor, _) = live_executor();
+    let executor = BatchExecutor::from_task_executor(task_executor);
+
+    let mut t1 = BatchTaskItem::new(
+        "live-batch-1",
+        "Implement `is_prime(n: int) -> bool`. Return only the code.",
+    );
+    t1.task_type = TaskType::GenerateFunction;
+    let mut t2 = BatchTaskItem::new(
+        "live-batch-2",
+        "Implement `slugify(text: str) -> str` returning a lowercase hyphen-separated ASCII slug. Return only the code.",
+    );
+    t2.task_type = TaskType::GenerateFunction;
+    let mut t3 = BatchTaskItem::new(
+        "live-batch-3",
+        "Implement `chunk_list(items: list, size: int) -> list[list]` raising ValueError if size <= 0. Return only the code.",
+    );
+    t3.task_type = TaskType::GenerateFunction;
+
+    let mut batch = BatchTask::new("live-py-utils", vec![t1, t2, t3]);
+    batch.defaults.model = Some(model);
+    batch.defaults.language = Some("python".into());
+
+    let result = executor
+        .execute(&batch, &BatchRuntimeOverrides::default())
+        .await;
+    assert_eq!(
+        result.status,
+        BatchStatus::Completed,
+        "live batch result: {result:?}"
+    );
+    assert_eq!(result.summary.succeeded_tasks, 3);
+    assert!(result.metrics.total_prompt_tokens > 0);
+    assert!(result.metrics.total_generated_tokens > 0);
 }

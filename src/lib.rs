@@ -4,6 +4,7 @@
 //! metrics calculation, and non-executing output validation logic from the CLI
 //! entry point.
 
+pub mod batch;
 pub mod benchmark;
 pub mod client;
 pub mod config;
@@ -13,6 +14,11 @@ pub mod prompt;
 pub mod task;
 pub mod validation;
 
+pub use batch::{
+    BATCH_SCHEMA_VERSION, BatchDefaults, BatchDryRunReport, BatchDryRunTask, BatchExecutor,
+    BatchMetrics, BatchPolicy, BatchResult, BatchRuntimeOverrides, BatchStatus, BatchSummary,
+    BatchTask, BatchTaskItem, MAX_BATCH_TASKS, MAX_BATCH_TIMEOUT_SECS, dry_run_batch,
+};
 pub use benchmark::{
     BenchmarkConfig, BenchmarkEndpoint, BenchmarkReport, BenchmarkRunner, BenchmarkScenario,
     BenchmarkSuite, BenchmarkSummary, MAX_BENCHMARK_ITERATIONS, ScenarioRunRecord,

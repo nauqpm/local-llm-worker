@@ -2,7 +2,6 @@ mod cli;
 
 use std::process::ExitCode;
 
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 fn init_logging() {
@@ -17,6 +16,6 @@ fn init_logging() {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     init_logging();
-    let args = cli::Cli::parse();
+    let args = cli::Cli::parse_with_sources();
     cli::execute_cli(args).await
 }

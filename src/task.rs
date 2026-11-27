@@ -401,6 +401,11 @@ impl<C: OllamaClient> TaskExecutor<C> {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) const fn client(&self) -> &C {
+        &self.client
+    }
+
     /// Checks Ollama liveness (`/api/version`) and currently loaded models (`/api/ps`).
     pub async fn health(&self, base_url: &str) -> WorkerResult<HealthReport> {
         let version = self.client.version().await?;
@@ -457,6 +462,22 @@ impl<C: OllamaClient> TaskExecutor<C> {
     where
         F: Future<Output = ()> + Send,
     {
+        let mut model_cache = None;
+        self.execute_with_cancel_and_model_cache(request, cancel, &mut model_cache)
+            .await
+    }
+
+    /// Executes a single task while optionally reusing a cached `/api/tags` snapshot
+    /// across sequential batch tasks.
+    pub(crate) async fn execute_with_cancel_and_model_cache<F>(
+        &self,
+        request: &TaskRequest,
+        cancel: F,
+        cached_models: &mut Option<Vec<InstalledModel>>,
+    ) -> TaskResult
+    where
+        F: Future<Output = ()> + Send,
+    {
         if let Err(err) = request.validate() {
             return TaskResult::from_error(&request.task_id, &request.model, &err);
         }
@@ -475,24 +496,28 @@ impl<C: OllamaClient> TaskExecutor<C> {
         tokio::pin!(cancel);
 
         if self.verify_model {
-            let list_result = tokio::select! {
-                biased;
-                () = &mut cancel => {
-                    return TaskResult::from_error(task_id, model, &WorkerError::Cancelled);
-                }
-                res = self.client.list_models() => res,
-            };
-
-            match list_result {
-                Ok(installed) => {
-                    if !installed.iter().any(|m| model_matches(&m.name, model)) {
-                        let err = WorkerError::ModelNotFound {
-                            model: model.to_owned(),
-                        };
-                        return TaskResult::from_error(task_id, model, &err);
+            if cached_models.is_none() {
+                let list_result = tokio::select! {
+                    biased;
+                    () = &mut cancel => {
+                        return TaskResult::from_error(task_id, model, &WorkerError::Cancelled);
                     }
+                    res = self.client.list_models() => res,
+                };
+
+                match list_result {
+                    Ok(installed) => *cached_models = Some(installed),
+                    Err(err) => return TaskResult::from_error(task_id, model, &err),
                 }
-                Err(err) => return TaskResult::from_error(task_id, model, &err),
+            }
+
+            if let Some(installed) = cached_models.as_deref()
+                && !installed.iter().any(|m| model_matches(&m.name, model))
+            {
+                let err = WorkerError::ModelNotFound {
+                    model: model.to_owned(),
+                };
+                return TaskResult::from_error(task_id, model, &err);
             }
         }
 

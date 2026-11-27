@@ -67,18 +67,23 @@ flowchart LR
     end
 
     subgraph Lib["Core Library (src/lib.rs)"]
+        Batch["BatchExecutor (Sequential, concurrency = 1)"]
         Exec["TaskExecutor (Orchestrator)"]
         Config["WorkerConfig & InferenceOptions"]
         Task["TaskSchema & Input Validator"]
         Prompt["PromptBuilder & Budget Estimator"]
         Client["OllamaClient Trait + HttpOllamaClient"]
         Valid["OutputValidator (Non-executing)"]
-        Metrics["MetricsCalculator"]
+        Metrics["MetricsCalculator & BatchMetrics"]
         Err["WorkerError (Typed Categories)"]
     end
 
     Args --> Exec
+    Args --> Batch
     IO --> Exec
+    IO --> Batch
+    Batch --> Exec
+    Batch --> Metrics
     Exec --> Config
     Exec --> Task
     Exec --> Prompt

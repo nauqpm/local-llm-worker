@@ -1,21 +1,32 @@
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use clap::{Args, Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use ollama_worker::{
-    BenchmarkConfig, BenchmarkEndpoint, BenchmarkRunner, BenchmarkSuite, DEFAULT_OLLAMA_BASE_URL,
+    BatchExecutor, BatchResult, BatchRuntimeOverrides, BatchTask, BenchmarkConfig,
+    BenchmarkEndpoint, BenchmarkRunner, BenchmarkSuite, DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_TIMEOUT_SECS, ErrorDetail, HttpOllamaClient, InferenceOptions, InstalledModel,
-    TaskExecutor, TaskRequest, TaskResult, TaskType, WorkerConfig, WorkerError, WorkerResult,
+    MAX_BATCH_TASKS, PromptBuilder, TaskExecutor, TaskRequest, TaskResult, TaskType, WorkerConfig,
+    WorkerError, WorkerResult, dry_run_batch,
 };
 use serde::Serialize;
 
 const DEFAULT_CLI_TASK_ID: &str = "cli-task";
+const DEFAULT_CLI_BATCH_ID: &str = "cli-batch";
 
-/// Hard upper bound (1 MiB) for `--input` files and `--stdin` payloads.
+/// Hard upper bound (1 MiB) for single-task `--input` files and `--stdin` payloads.
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
+
+/// Hard upper bound (4 MiB) for batch `--input` files and `--stdin` payloads.
+const MAX_BATCH_INPUT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Monotonic sequence counter preventing temporary-file collisions within the same PID.
+static ATOMIC_WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -50,8 +61,36 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = false)]
     pub pretty: bool,
 
+    /// Internal marker set when `--timeout` was explicitly passed on the command line.
+    #[arg(skip)]
+    pub timeout_explicit: bool,
+
     #[command(subcommand)]
     pub command: Commands,
+}
+
+impl Cli {
+    /// Parses CLI arguments and records whether global `--timeout` was explicitly supplied.
+    pub fn parse_with_sources() -> Self {
+        let matches = Self::command().get_matches();
+        let timeout_explicit = matches.value_source("timeout") == Some(ValueSource::CommandLine);
+        let mut cli = Self::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+        cli.timeout_explicit = timeout_explicit;
+        cli
+    }
+
+    #[cfg(test)]
+    fn try_parse_with_sources<I, T>(itr: I) -> Result<Self, clap::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = Self::command().try_get_matches_from(itr)?;
+        let timeout_explicit = matches.value_source("timeout") == Some(ValueSource::CommandLine);
+        let mut cli = Self::from_arg_matches(&matches)?;
+        cli.timeout_explicit = timeout_explicit;
+        Ok(cli)
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -70,8 +109,85 @@ pub enum Commands {
     },
     /// Execute a single local inference task and emit structured JSON to stdout.
     Run(Box<RunArgs>),
+    /// Execute a sequential batch of local inference tasks (concurrency = 1) and emit structured JSON.
+    Batch(Box<BatchArgs>),
     /// Run a reproducible benchmark suite and emit structured metrics JSON.
     Benchmark(Box<BenchmarkArgs>),
+}
+
+#[derive(Debug, Args)]
+pub struct BatchArgs {
+    /// Path to a BatchTask JSON file (mutually exclusive with --stdin).
+    #[arg(long, conflicts_with = "stdin")]
+    pub input: Option<PathBuf>,
+
+    /// Read a BatchTask JSON payload from stdin (mutually exclusive with --input).
+    #[arg(long, default_value_t = false, conflicts_with = "input")]
+    pub stdin: bool,
+
+    /// Optional file path to write the structured BatchResult JSON (atomically updated after each task).
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Suppress stdout JSON when --output is used.
+    #[arg(long, default_value_t = false, requires = "output")]
+    pub quiet: bool,
+
+    /// Disable per-task atomic checkpoint writes to --output; write only once on completion.
+    #[arg(long, default_value_t = false, requires = "output")]
+    pub no_incremental_output: bool,
+
+    /// Validate batch envelope and every task, build prompts, and estimate tokens without calling Ollama.
+    #[arg(long, default_value_t = false)]
+    pub dry_run: bool,
+
+    /// Stop executing remaining tasks after the first non-success task (overrides policy.fail_fast).
+    #[arg(long, default_value_t = false, conflicts_with = "continue_on_error")]
+    pub fail_fast: bool,
+
+    /// Continue executing remaining tasks on per-task failure (overrides policy.fail_fast).
+    #[arg(long, default_value_t = false, conflicts_with = "fail_fast")]
+    pub continue_on_error: bool,
+
+    /// Explicit per-task timeout override in seconds (1..=3600).
+    #[arg(long)]
+    pub task_timeout: Option<u64>,
+
+    /// Overall batch wall-clock timeout in seconds (1..=14400).
+    #[arg(long)]
+    pub batch_timeout: Option<u64>,
+
+    /// Target Ollama model override for all tasks in the batch.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Sampling temperature override in 0.0..=2.0 for all tasks.
+    #[arg(long)]
+    pub temperature: Option<f32>,
+
+    /// Maximum tokens override (`options.num_predict`) for all tasks.
+    #[arg(long)]
+    pub max_tokens: Option<u32>,
+
+    /// Explicit context window override (`options.num_ctx`) for all tasks.
+    #[arg(long)]
+    pub num_ctx: Option<u32>,
+
+    /// Deterministic sampling seed override for all tasks.
+    #[arg(long)]
+    pub seed: Option<i64>,
+
+    /// Per-request model keep-alive duration override (e.g., `5m`, `10m`).
+    #[arg(long)]
+    pub keep_alive: Option<String>,
+
+    /// Enable streaming NDJSON inference to record TTFT across all tasks.
+    #[arg(long, default_value_t = false)]
+    pub stream: bool,
+
+    /// Skip the cached `/api/tags` model existence check.
+    #[arg(long, default_value_t = false)]
+    pub skip_model_check: bool,
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +350,17 @@ pub async fn execute_cli(cli: Cli) -> ExitCode {
             run_task(
                 cli.base_url,
                 cli.timeout,
+                cli.allow_remote_ollama,
+                *args,
+                pretty,
+            )
+            .await
+        }
+        Commands::Batch(args) => {
+            run_batch(
+                cli.base_url,
+                cli.timeout,
+                cli.timeout_explicit,
                 cli.allow_remote_ollama,
                 *args,
                 pretty,
@@ -459,6 +586,210 @@ async fn run_task(
     emit_task_result(&result, output_path.as_deref(), quiet, pretty)
 }
 
+async fn run_batch(
+    base_url: String,
+    timeout: u64,
+    timeout_explicit: bool,
+    allow_remote_ollama: bool,
+    args: BatchArgs,
+    pretty: bool,
+) -> ExitCode {
+    let output_path = args.output.clone();
+    let quiet = args.quiet;
+    let fail_fast_hint = args.fail_fast;
+
+    if let Some(path) = output_path.as_deref()
+        && let Err(err) = validate_atomic_output_path(path)
+    {
+        let result = BatchResult::from_error(DEFAULT_CLI_BATCH_ID, fail_fast_hint, vec![], &err);
+        return emit_payload(&result, None, false, pretty, result.exit_code());
+    }
+
+    if let Err(err) = WorkerConfig::new(&base_url, timeout, allow_remote_ollama, None) {
+        let result = BatchResult::from_error(DEFAULT_CLI_BATCH_ID, fail_fast_hint, vec![], &err);
+        return emit_batch_result(&result, output_path.as_deref(), quiet, pretty);
+    }
+
+    let batch = match load_batch_task(&args) {
+        Ok(b) => b,
+        Err(err) => {
+            let result =
+                BatchResult::from_error(DEFAULT_CLI_BATCH_ID, fail_fast_hint, vec![], &err);
+            return emit_batch_result(&result, output_path.as_deref(), quiet, pretty);
+        }
+    };
+
+    let overrides = build_batch_overrides(&args, timeout, timeout_explicit);
+    let effective_fail_fast = batch.effective_fail_fast(&overrides);
+    let batch_id = if batch.batch_id.trim().is_empty() {
+        DEFAULT_CLI_BATCH_ID.to_owned()
+    } else {
+        batch.batch_id.trim().to_owned()
+    };
+    let bounded_task_ids: Vec<String> = if batch.tasks.len() <= MAX_BATCH_TASKS {
+        batch
+            .tasks
+            .iter()
+            .map(|t| t.task_id.trim().to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if let Err(err) = overrides
+        .validate()
+        .and_then(|()| batch.validate_envelope())
+    {
+        let result = BatchResult::from_error(batch_id, effective_fail_fast, bounded_task_ids, &err);
+        return emit_batch_result(&result, output_path.as_deref(), quiet, pretty);
+    }
+
+    if args.dry_run {
+        return match dry_run_batch(&batch, &overrides, &PromptBuilder::default()) {
+            Ok(report) => emit_atomic_payload(
+                &report,
+                output_path.as_deref(),
+                quiet,
+                pretty,
+                report.exit_code(),
+            ),
+            Err(err) => {
+                let result =
+                    BatchResult::from_error(batch_id, effective_fail_fast, bounded_task_ids, &err);
+                emit_batch_result(&result, output_path.as_deref(), quiet, pretty)
+            }
+        };
+    }
+
+    let client_timeout_secs = batch.max_effective_task_timeout_secs(&overrides);
+    let config = match WorkerConfig::new(&base_url, client_timeout_secs, allow_remote_ollama, None)
+    {
+        Ok(cfg) => cfg.with_verify_model(!args.skip_model_check),
+        Err(err) => {
+            let result =
+                BatchResult::from_error(batch_id, effective_fail_fast, bounded_task_ids, &err);
+            return emit_batch_result(&result, output_path.as_deref(), quiet, pretty);
+        }
+    };
+
+    let client = match HttpOllamaClient::new(config.clone()) {
+        Ok(c) => c,
+        Err(err) => {
+            let result =
+                BatchResult::from_error(batch_id, effective_fail_fast, bounded_task_ids, &err);
+            return emit_batch_result(&result, output_path.as_deref(), quiet, pretty);
+        }
+    };
+
+    let executor = BatchExecutor::new(client, config.verify_model());
+    let incremental_path = (!args.no_incremental_output)
+        .then_some(output_path.as_deref())
+        .flatten();
+
+    let result = if let Some(path) = incremental_path {
+        executor
+            .execute_with_cancel_and_hook(&batch, &overrides, shutdown_signal(), |snapshot| {
+                match render_json(snapshot, pretty) {
+                    Ok(rendered) => {
+                        if let Err(err) = write_output_file_atomic(path, &format!("{rendered}\n")) {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %err,
+                                "failed to persist incremental batch checkpoint"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "failed to serialize incremental batch checkpoint"
+                        );
+                    }
+                }
+            })
+            .await
+    } else {
+        executor
+            .execute_with_cancel(&batch, &overrides, shutdown_signal())
+            .await
+    };
+
+    emit_batch_result(&result, output_path.as_deref(), quiet, pretty)
+}
+
+fn load_batch_task(args: &BatchArgs) -> WorkerResult<BatchTask> {
+    let raw = if let Some(path) = &args.input {
+        read_limited_file(path, MAX_BATCH_INPUT_BYTES)?
+    } else if args.stdin {
+        read_limited_reader(io::stdin().lock(), MAX_BATCH_INPUT_BYTES, "stdin")?
+    } else {
+        return Err(WorkerError::InvalidInput {
+            message: "provide either --input <FILE> or --stdin for batch execution".into(),
+        });
+    };
+
+    if raw.trim().is_empty() {
+        return Err(WorkerError::InvalidInput {
+            message: "batch JSON input is empty".into(),
+        });
+    }
+
+    serde_json::from_str::<BatchTask>(&raw).map_err(|err| WorkerError::InvalidInput {
+        message: format!("failed to parse batch JSON: {err}"),
+    })
+}
+
+fn build_batch_overrides(
+    args: &BatchArgs,
+    default_task_timeout_secs: u64,
+    timeout_explicit: bool,
+) -> BatchRuntimeOverrides {
+    let fallback_model = std::env::var("OLLAMA_WORKER_MODEL")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+
+    let fail_fast = if args.fail_fast {
+        Some(true)
+    } else if args.continue_on_error {
+        Some(false)
+    } else {
+        None
+    };
+
+    let has_option_override = args.temperature.is_some()
+        || args.num_ctx.is_some()
+        || args.max_tokens.is_some()
+        || args.seed.is_some()
+        || args.keep_alive.is_some()
+        || args.stream;
+
+    let options = has_option_override.then(|| InferenceOptions {
+        temperature: args.temperature,
+        num_ctx: args.num_ctx,
+        max_tokens: args.max_tokens,
+        seed: args.seed,
+        keep_alive: args.keep_alive.clone(),
+        stream: args.stream,
+    });
+
+    // Explicit `--task-timeout` takes top precedence; an explicit global `--timeout`
+    // also overrides JSON task/policy timeouts, whereas the built-in/env default acts as fallback.
+    let task_timeout_secs = args
+        .task_timeout
+        .or_else(|| timeout_explicit.then_some(default_task_timeout_secs));
+
+    BatchRuntimeOverrides {
+        model: args.model.clone(),
+        fallback_model,
+        fail_fast,
+        task_timeout_secs,
+        default_task_timeout_secs,
+        batch_timeout_secs: args.batch_timeout,
+        options,
+    }
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -605,7 +936,7 @@ fn read_limited_reader<R: Read>(reader: R, max_bytes: usize, label: &str) -> Wor
     })
 }
 
-fn write_output_file(path: &Path, contents: &str) -> WorkerResult<()> {
+fn validate_output_path(path: &Path) -> WorkerResult<()> {
     if path.is_dir() {
         return Err(WorkerError::InvalidInput {
             message: format!("output path '{}' is a directory", path.display()),
@@ -622,9 +953,114 @@ fn write_output_file(path: &Path, contents: &str) -> WorkerResult<()> {
             ),
         });
     }
+    Ok(())
+}
+
+fn validate_atomic_output_path(path: &Path) -> WorkerResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err(WorkerError::InvalidInput {
+                    message: format!(
+                        "output path '{}' is a symbolic link; provide a direct regular file path",
+                        path.display()
+                    ),
+                });
+            }
+            if meta.is_dir() {
+                return Err(WorkerError::InvalidInput {
+                    message: format!("output path '{}' is a directory", path.display()),
+                });
+            }
+            if !meta.is_file() {
+                return Err(WorkerError::InvalidInput {
+                    message: format!(
+                        "output path '{}' is not a regular file; atomic persistence requires a regular file",
+                        path.display()
+                    ),
+                });
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(WorkerError::InvalidInput {
+                message: format!("cannot inspect output path '{}': {err}", path.display()),
+            });
+        }
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        if !parent.exists() {
+            return Err(WorkerError::InvalidInput {
+                message: format!(
+                    "parent directory '{}' for --output does not exist",
+                    parent.display()
+                ),
+            });
+        }
+        if !parent.is_dir() {
+            return Err(WorkerError::InvalidInput {
+                message: format!(
+                    "parent path '{}' for --output is not a directory",
+                    parent.display()
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn write_output_file(path: &Path, contents: &str) -> WorkerResult<()> {
+    validate_output_path(path)?;
     fs::write(path, contents).map_err(|err| WorkerError::Internal {
         message: format!("failed to write output file '{}': {err}", path.display()),
     })
+}
+
+fn write_output_file_atomic(path: &Path, contents: &str) -> WorkerResult<()> {
+    validate_atomic_output_path(path)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("output.json"));
+    let seq = ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{file_name}.tmp.{}.{seq}", std::process::id());
+    let tmp_path = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    };
+
+    let write_res = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)?;
+        file.write_all(contents.as_bytes())?;
+        file.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(WorkerError::Internal {
+            message: format!(
+                "failed to write temporary output file '{}': {err}",
+                tmp_path.display()
+            ),
+        });
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(WorkerError::Internal {
+            message: format!("failed to commit output file '{}': {err}", path.display()),
+        });
+    }
+
+    Ok(())
 }
 
 fn emit_task_result(
@@ -634,6 +1070,47 @@ fn emit_task_result(
     pretty: bool,
 ) -> ExitCode {
     emit_payload(result, output_path, quiet, pretty, result.exit_code())
+}
+
+fn emit_batch_result(
+    result: &BatchResult,
+    output_path: Option<&Path>,
+    quiet: bool,
+    pretty: bool,
+) -> ExitCode {
+    emit_atomic_payload(result, output_path, quiet, pretty, result.exit_code())
+}
+
+fn emit_atomic_payload<T: Serialize>(
+    value: &T,
+    output_path: Option<&Path>,
+    quiet: bool,
+    pretty: bool,
+    exit_code: u8,
+) -> ExitCode {
+    let rendered = match render_json(value, pretty) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("error: failed to serialize JSON output: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let write_err =
+        output_path.and_then(|path| write_output_file_atomic(path, &format!("{rendered}\n")).err());
+
+    // Preserve structured JSON on stdout whenever `--quiet` is not set, even if final
+    // file persistence fails (for example, disk full after multi-minute batch inference).
+    if !quiet {
+        println!("{rendered}");
+    }
+
+    if let Some(err) = write_err {
+        eprintln!("error: {err}");
+        return ExitCode::from(err.exit_code());
+    }
+
+    ExitCode::from(exit_code)
 }
 
 fn emit_payload<T: Serialize>(
@@ -706,7 +1183,6 @@ fn bytes_to_mib(bytes: u64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn cli_definition_is_valid() {
@@ -799,5 +1275,161 @@ mod tests {
         let err = read_limited_reader(&oversized[..], 32, "stdin")
             .expect_err("payload over limit must fail");
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn cli_parses_batch_command_and_enforces_flag_constraints() {
+        let cli = Cli::try_parse_from([
+            "ollama-worker",
+            "--pretty",
+            "batch",
+            "--input",
+            "batch.json",
+            "--output",
+            "out.json",
+            "--quiet",
+            "--fail-fast",
+            "--task-timeout",
+            "90",
+            "--batch-timeout",
+            "600",
+            "--model",
+            "qwen2.5-coder:3b",
+            "--stream",
+            "--skip-model-check",
+        ])
+        .expect("CLI should parse valid batch arguments");
+
+        assert!(cli.pretty);
+        match cli.command {
+            Commands::Batch(args) => {
+                assert_eq!(args.input.as_deref(), Some(Path::new("batch.json")));
+                assert_eq!(args.output.as_deref(), Some(Path::new("out.json")));
+                assert!(args.quiet);
+                assert!(args.fail_fast);
+                assert!(!args.continue_on_error);
+                assert_eq!(args.task_timeout, Some(90));
+                assert_eq!(args.batch_timeout, Some(600));
+                assert_eq!(args.model.as_deref(), Some("qwen2.5-coder:3b"));
+                assert!(args.stream);
+                assert!(args.skip_model_check);
+            }
+            other => panic!("expected Batch command, got {other:?}"),
+        }
+
+        // Mutually exclusive input sources.
+        assert!(
+            Cli::try_parse_from(["ollama-worker", "batch", "--input", "b.json", "--stdin"])
+                .is_err()
+        );
+        // Mutually exclusive failure policies.
+        assert!(
+            Cli::try_parse_from([
+                "ollama-worker",
+                "batch",
+                "--stdin",
+                "--fail-fast",
+                "--continue-on-error"
+            ])
+            .is_err()
+        );
+        // --quiet and --no-incremental-output require --output.
+        assert!(Cli::try_parse_from(["ollama-worker", "batch", "--stdin", "--quiet"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ollama-worker",
+                "batch",
+                "--stdin",
+                "--no-incremental-output"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn atomic_output_writer_commits_and_replaces_without_leaving_temp_files() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ollama-worker-atomic-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        let target = dir.join("batch_result.json");
+
+        write_output_file_atomic(&target, "{\"step\":1}\n").expect("first write should succeed");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"step\":1}\n");
+
+        write_output_file_atomic(&target, "{\"step\":2}\n").expect("replace write should succeed");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"step\":2}\n");
+
+        let remaining_entries: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(remaining_entries.len(), 1);
+
+        let dir_err = write_output_file_atomic(&dir, "{}").expect_err("directory path must fail");
+        assert_eq!(dir_err.exit_code(), 2);
+
+        let missing_parent = dir.join("missing").join("out.json");
+        let parent_err =
+            write_output_file_atomic(&missing_parent, "{}").expect_err("missing parent must fail");
+        assert_eq!(parent_err.exit_code(), 2);
+
+        #[cfg(unix)]
+        {
+            let link_path = dir.join("link.json");
+            std::os::unix::fs::symlink(&target, &link_path).expect("symlink should be created");
+            let sym_err =
+                write_output_file_atomic(&link_path, "{}").expect_err("symlink path must fail");
+            assert_eq!(sym_err.exit_code(), 2);
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_tracks_explicit_global_timeout_for_batch_overrides() {
+        // Default (implicit) timeout does not override policy.task_timeout_secs.
+        let implicit = Cli::try_parse_with_sources(["ollama-worker", "batch", "--stdin"])
+            .expect("should parse");
+        assert!(!implicit.timeout_explicit);
+        let Commands::Batch(args) = implicit.command else {
+            panic!("expected Batch");
+        };
+        let overrides = build_batch_overrides(&args, implicit.timeout, implicit.timeout_explicit);
+        assert_eq!(overrides.task_timeout_secs, None);
+        assert_eq!(overrides.default_task_timeout_secs, DEFAULT_TIMEOUT_SECS);
+
+        // Explicit global `--timeout` acts as CLI task timeout override when `--task-timeout` is absent.
+        let explicit =
+            Cli::try_parse_with_sources(["ollama-worker", "--timeout", "30", "batch", "--stdin"])
+                .expect("should parse");
+        assert!(explicit.timeout_explicit);
+        let Commands::Batch(args) = explicit.command else {
+            panic!("expected Batch");
+        };
+        let overrides = build_batch_overrides(&args, explicit.timeout, explicit.timeout_explicit);
+        assert_eq!(overrides.task_timeout_secs, Some(30));
+
+        // Explicit `--task-timeout` takes precedence over explicit global `--timeout`.
+        let both = Cli::try_parse_with_sources([
+            "ollama-worker",
+            "--timeout",
+            "30",
+            "batch",
+            "--stdin",
+            "--task-timeout",
+            "45",
+        ])
+        .expect("should parse");
+        let Commands::Batch(args) = both.command else {
+            panic!("expected Batch");
+        };
+        let overrides = build_batch_overrides(&args, both.timeout, both.timeout_explicit);
+        assert_eq!(overrides.task_timeout_secs, Some(45));
     }
 }

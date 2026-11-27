@@ -15,6 +15,7 @@ pub mod exit_codes {
     pub const MODEL_NOT_FOUND: u8 = 4;
     pub const TIMEOUT: u8 = 5;
     pub const VALIDATION_FAILED: u8 = 6;
+    pub const PARTIAL_FAILURE: u8 = 7;
     pub const CANCELLED: u8 = 130;
 }
 
@@ -221,6 +222,7 @@ mod tests {
             6
         );
         assert_eq!(WorkerError::Cancelled.exit_code(), 130);
+        assert_eq!(exit_codes::PARTIAL_FAILURE, 7);
         assert_eq!(
             WorkerError::Internal {
                 message: "unexpected".into()

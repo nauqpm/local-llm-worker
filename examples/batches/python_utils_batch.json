@@ -1,0 +1,50 @@
+{
+  "schema_version": "1",
+  "batch_id": "example-python-utils-001",
+  "defaults": {
+    "model": "qwen2.5-coder:3b",
+    "language": "python",
+    "options": {
+      "temperature": 0.1,
+      "max_tokens": 256,
+      "seed": 42
+    }
+  },
+  "policy": {
+    "fail_fast": false,
+    "task_timeout_secs": 120,
+    "batch_timeout_secs": 600
+  },
+  "tasks": [
+    {
+      "task_id": "fn-is-prime",
+      "task_type": "generate_function",
+      "instruction": "Implement `is_prime(n: int) -> bool` that returns True if n is prime and False otherwise.",
+      "constraints": [
+        "Use Python standard library only",
+        "Handle integers less than 2 cleanly",
+        "Return only the function implementation"
+      ]
+    },
+    {
+      "task_id": "fn-slugify",
+      "task_type": "generate_function",
+      "instruction": "Implement `slugify(text: str) -> str` converting text to a lowercase ASCII slug with words separated by single hyphens.",
+      "constraints": [
+        "Use Python standard library only",
+        "Collapse repeated hyphens and strip leading or trailing hyphens",
+        "Return only the function implementation"
+      ]
+    },
+    {
+      "task_id": "fn-chunk-list",
+      "task_type": "generate_function",
+      "instruction": "Implement `chunk_list(items: list, size: int) -> list[list]` that splits items into consecutive sublists of at most `size` elements.",
+      "constraints": [
+        "Raise ValueError if size <= 0",
+        "Return an empty list when items is empty",
+        "Return only the function implementation"
+      ]
+    }
+  ]
+}

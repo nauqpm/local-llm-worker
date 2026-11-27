@@ -92,24 +92,74 @@ ollama-worker run --model qwen2.5-coder:3b --type generate_function --lang pytho
 ollama-worker run --input task.json [--output result.json] [--quiet] [--stream] [--pretty]
 cat task.json | ollama-worker run --stdin [--stream]
 ollama-worker run --input task.json --dry-run [--pretty]
+ollama-worker batch --input batch.json [--output batch_result.json] [--quiet] [--fail-fast|--continue-on-error] [--task-timeout SECS] [--batch-timeout SECS] [--stream] [--dry-run] [--pretty]
+cat batch.json | ollama-worker batch --stdin [--output batch_result.json] [--fail-fast]
 ollama-worker benchmark --model qwen2.5-coder:3b [--suite FILE] [--endpoint chat|generate|both] [--stream] [--cold-start] [--iterations N]
 ```
 
 ### Stream Separation & Exit Codes
 
-- `stdout`: Strictly machine-readable JSON output for `run` (and when `--json` is passed to `health`/`models`).
+- `stdout`: Strictly machine-readable JSON output for `run` and `batch` (and when `--json` is passed to `health`/`models`).
 - `stderr`: Structured logs (`tracing`), diagnostics, and warnings.
 
 | Exit Code | Meaning |
 | :--- | :--- |
-| `0` | Success (`status == "success"`) |
+| `0` | Success (`status == "success"` for `run`, `status == "completed"` for `batch`) |
 | `1` | Unexpected internal error |
 | `2` | Invalid input, configuration error, or context budget exceeded |
 | `3` | Ollama unavailable, network/HTTP 5xx error, or malformed protocol response |
 | `4` | Requested model not found |
-| `5` | Request timeout |
+| `5` | Request or overall batch timeout (`status == "timeout"` / `"timed_out"`) |
 | `6` | Output validation failed (`status == "validation_failed"`) |
-| `130` | Cancelled via `SIGINT` (`128 + 2`) |
+| `7` | Partial batch completion (`batch` only: `status == "partial_success"`, >= 1 succeeded and >= 1 failed/timed out/skipped) |
+| `130` | Cancelled via `SIGINT`/`SIGTERM` (`128 + 2`; preserves completed batch results) |
+
+## 3.1 Sequential Batch Contracts (`v0.2.0`, `schema_version = "1"`)
+
+`BatchTask` executes independent tasks strictly sequentially (`concurrency = 1`) through the existing single-task `TaskExecutor` pipeline. Any v0.1.0 `TaskRequest` JSON object is accepted verbatim in `tasks`, while concise items may omit `schema_version`, `model`, `language`, `system_prompt`, `options`, or `output_expectation` to inherit from `defaults`.
+
+### `BatchTask` Input Schema
+
+```json
+{
+  "schema_version": "1",
+  "batch_id": "example-python-utils-001",
+  "defaults": {
+    "model": "qwen2.5-coder:3b",
+    "language": "python",
+    "options": { "temperature": 0.1, "max_tokens": 256, "seed": 42 }
+  },
+  "policy": {
+    "fail_fast": false,
+    "task_timeout_secs": 120,
+    "batch_timeout_secs": 600
+  },
+  "tasks": [
+    {
+      "task_id": "fn-is-prime",
+      "task_type": "generate_function",
+      "instruction": "Implement `is_prime(n: int) -> bool`."
+    }
+  ]
+}
+```
+
+### `BatchResult` Output Schema
+
+- `status`: `"completed"`, `"partial_success"`, `"failed"`, `"timed_out"`, `"cancelled"` (or `"in_progress"` in intermediate atomic checkpoints written to `--output`).
+- `summary`: `total_tasks`, `executed_tasks`, `succeeded_tasks`, `validation_failed_tasks`, `error_tasks`, `timed_out_tasks`, `cancelled_tasks`, `skipped_tasks`.
+- `metrics`: `batch_wall_clock_ms`, `batch_overhead_ms`, `unattributed_duration_ms` (wall-clock ms spent in tasks without Ollama telemetry such as cancelled/timed-out/transport-errored tasks), `total_worker_overhead_ms`, `avg_worker_overhead_ms`, `total_ollama_duration_ms`, `total_load_duration_ms`, `total_prompt_eval_duration_ms`, `total_eval_duration_ms`, `total_prompt_tokens`, `total_generated_tokens`, `avg_prompt_tokens_per_second`, `avg_generation_tokens_per_second`, and optional `avg_ttft_ms`.
+- `results`: Array of standard v0.1.0 `TaskResult` objects in execution order.
+- `skipped_task_ids`: Ordered IDs of tasks not executed due to `fail_fast`, `batch_timeout_secs`, or cancellation.
+- `error`: Optional batch-level `ErrorDetail` (envelope error, batch timeout, or cancellation).
+
+### Batch Precedence & Persistence
+
+- **Configuration precedence:** `CLI batch flags > Per-task JSON item > BatchTask.defaults/policy > Global CLI / Env > Built-in Defaults`.
+  - Explicitly passing global `--timeout <SECS>` on the CLI also overrides JSON `policy.task_timeout_secs` and `item.timeout_secs` unless `--task-timeout` is supplied; otherwise the built-in/env timeout acts as fallback.
+  - Partial `options` objects in `BatchTask` merge on top of `InferenceOptions::default()` (`temperature: 0.1`, `max_tokens: 512`) so CPU generation remains bounded; `stream` is additive (`||`).
+- **Atomic incremental output:** When `--output <FILE>` is passed to `ollama-worker batch`, the destination must be a direct regular file (symlinks, directories, and device/special files are rejected). Completed results are atomically checkpointed after each task using an exclusive same-directory temp file (`.<name>.tmp.<pid>.<seq>`), `sync_all()`, and `rename` (disable with `--no-incremental-output`). If final file persistence fails, structured JSON is still emitted to `stdout` unless `--quiet` is set.
+- **Bounds:** Maximum batch input size `4 MiB`, maximum `100` tasks per batch, maximum `batch_timeout_secs = 14400` (4 hours).
 
 ### Configuration Precedence
 
