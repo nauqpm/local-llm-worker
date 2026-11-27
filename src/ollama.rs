@@ -158,6 +158,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<OllamaOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_alive: Option<String>,
@@ -183,9 +185,17 @@ impl ChatRequest {
             model: model.into(),
             messages,
             stream: false,
+            format: None,
             options: (!ollama_opts.is_empty()).then_some(ollama_opts),
             keep_alive: inference_options.keep_alive.clone(),
         }
+    }
+
+    /// Attaches a native Ollama output format constraint (`"json"` or a JSON Schema object).
+    #[must_use]
+    pub fn with_format(mut self, format: serde_json::Value) -> Self {
+        self.format = Some(format);
+        self
     }
 }
 

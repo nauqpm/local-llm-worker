@@ -18,8 +18,8 @@ pub use ollama::{
     ModelDetails, OllamaClient, OllamaOptions, RunningModel, VersionResponse, model_matches,
 };
 pub use task::{
-    DEFAULT_SYSTEM_PROMPT, HealthReport, SCHEMA_VERSION, TaskExecutor, TaskRequest, TaskResult,
-    TaskStatus,
+    DEFAULT_SYSTEM_PROMPT, HealthReport, OutputExpectation, OutputFormat, SCHEMA_VERSION,
+    TaskExecutor, TaskRequest, TaskResult, TaskStatus, TaskType, ValidationCheck, ValidationReport,
 };
 
 /// Default loopback base URL for a local Ollama server.
